@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+sessions/
+profile-copy/
+outputs/
+logs/
+flow.log
+srv.live.log
+.git/
+.env
+ui-shots/
+reports/

@@ -1,0 +1,29 @@
+# Credentials & session data — never commit
+sessions/
+*.cookies.json
+*.token.json
+.env
+auth_token.json
+creds.json
+
+# Machine-local runtime data — never commit
+profile-copy/
+outputs/
+logs/
+reports/
+flow.log
+srv.live.log
+srv.*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Outputs
+*.mp4
+*.jpg
+*.png
+*.webp
+*.error.txt

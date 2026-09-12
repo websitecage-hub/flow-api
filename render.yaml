@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: flow-api
+    runtime: docker
+    plan: starter            # always-on (no sleep); needs paid plan for 24/7
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ROLE
+        value: api
+      - key: FLOW_PROJECT
+        sync: false          # your Flow project uuid (from local state file)
+      - key: FLOW_MODEL
+        value: NARWHAL
+      - key: API_KEYS
+        sync: false          # e.g. cms1:secret1,cms2:secret2 (content systems)
+      - key: RATE_POST_PER_MIN
+        value: "20"
+      - key: RATE_GET_PER_MIN
+        value: "120"
+      # --- durable file storage (optional, recommended for always-live) ---
+      # Cloudflare R2 (free 10GB, S3 API). Without these, files live on the
+      # container disk (lost on redeploy unless a Render Disk is attached).
+      - key: S3_ENDPOINT
+        sync: false          # e.g. https://<id>.r2.cloudflarestorage.com
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_KEY
+        sync: false
+      - key: S3_SECRET
+        sync: false
+      - key: S3_PUBLIC_BASE
+        sync: false          # e.g. https://pub-<id>.r2.dev
