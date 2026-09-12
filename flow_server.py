@@ -286,6 +286,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _fs.worker_heartbeat(w, j.get("info"))
             _fs.jlog("worker_heartbeat", worker=w)
             self._send(200, {"ok": True})
+        elif p.path == "/worker/cookies":
+            # home worker uploads fresh browser cookies so hosted reads
+            # (history/credits) stay alive without a local login
+            cookies = j.get("cookies") or []
+            if not isinstance(cookies, list) or not cookies:
+                self._send(400, {"ok": False, "error": "cookies required"})
+                return
+            try:
+                clean = [{"name": c.get("name", ""), "value": c.get("value", ""),
+                          "domain": c.get("domain", ""),
+                          "path": c.get("path", "/")}
+                         for c in cookies if c.get("name") and c.get("value")]
+                fp = Path(__file__).parent / "sessions" / "flow.cookies.full.json"
+                fp.parent.mkdir(exist_ok=True)
+                fp.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+                try:
+                    api.http.reset()
+                except Exception:
+                    pass
+                self._send(200, {"ok": True, "cookies": len(clean)})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": str(e)[:150]})
         elif p.path == "/worker/result":
             import base64 as _b64
             import flow_store as _fs

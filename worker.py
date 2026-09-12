@@ -60,6 +60,13 @@ class Remote:
         except Exception:
             pass
 
+    def push_cookies(self, cookies):
+        try:
+            return self._req("POST", "/worker/cookies", {"cookies": cookies})
+        except Exception as e:
+            print(f"[!] cookie sync failed: {str(e)[:120]}", flush=True)
+            return None
+
     def result(self, job, ok, result=None, error=""):
         try:
             self._req("POST", "/worker/result",
@@ -113,9 +120,27 @@ def main():
         return e.code or 1
     http = PureHTTP()
     idle = 0
+    last_cookie_sync = 0.0
     try:
         while True:
             remote.heartbeat(a.name, {"project": load_state().get("project_id", "")})
+            # keep hosted reads alive: push fresh browser cookies every 15 min
+            try:
+                if time.time() - last_cookie_sync > 900 and eng.browser:
+                    jar = []
+                    for ctx in eng.browser.contexts:
+                        for c in ctx.cookies():
+                            jar.append({"name": c["name"], "value": c["value"],
+                                        "domain": c["domain"],
+                                        "path": c.get("path", "/")})
+                    if jar:
+                        r = remote.push_cookies(jar)
+                        if r and r.get("ok"):
+                            last_cookie_sync = time.time()
+                            print(f"[*] synced {r.get('cookies')} cookies",
+                                  flush=True)
+            except Exception as e:
+                print(f"[!] cookie sync: {str(e)[:120]}", flush=True)
             job = remote.claim(a.name)
             if not job:
                 idle += 1
