@@ -5,8 +5,8 @@ ENV PYTHONUNBUFFERED=1 \
     ROLE=api
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.docker.txt .
+RUN pip install --no-cache-dir -r requirements.docker.txt
 
 # NOTE: engine code ships but never boots here (ROLE=api). The worker
 # (worker.py) runs on the machine that owns Chrome + the Google profile.

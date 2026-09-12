@@ -1,0 +1,5 @@
+# Slim runtime deps for the Render API role (no browser here).
+# boto3/pillow stay local-dev only (requirements.txt); server imports them
+# lazily / not at all, so Docker stays small and builds stay fast.
+playwright>=1.40
+curl_cffi>=0.5
