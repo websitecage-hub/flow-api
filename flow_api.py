@@ -1363,6 +1363,7 @@ class FlowAPI:
         self._q = _queue.Queue()
         self._ready = _threading.Event()
         self._threading = _threading
+        self._active = 0
         # False on hosted API role: jobs only queue, a remote worker runs them
         self.local_run = True
 
@@ -1380,14 +1381,24 @@ class FlowAPI:
         if not self._ready.is_set():
             raise RuntimeError("engine not started")
         with self.lock:
-            ev = self._threading.Event()
-            res = {}
-            self._q.put((fn, ev, res))
-            if not ev.wait(timeout):
-                raise TimeoutError("engine job timed out")
-            if "err" in res:
-                raise res["err"]
-            return res["v"]
+            self._active += 1
+            try:
+                ev = self._threading.Event()
+                res = {}
+                self._q.put((fn, ev, res))
+                if not ev.wait(timeout):
+                    raise TimeoutError("engine job timed out")
+                if "err" in res:
+                    raise res["err"]
+                return res["v"]
+            finally:
+                self._active -= 1
+
+    def is_busy(self):
+        try:
+            return self._active > 1 or not self._q.empty()
+        except Exception:
+            return False
 
     def start(self, boot_engine=True):
         def _boot():
@@ -1518,7 +1529,7 @@ class FlowAPI:
             out = {"ok": True, "engine_alive": alive, "session_ok": sess,
                    "project": st.get("project_id", ""),
                    "model": st.get("model", "NARWHAL"),
-                   "busy": self.lock.locked()}
+                    "busy": self.is_busy()}
             if not sess:
                 out["login_steps"] = [
                     "1. Run: python -u -c \"from flow_api import FlowEngine; "
