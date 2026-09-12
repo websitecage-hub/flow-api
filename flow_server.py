@@ -224,7 +224,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send(404, {"ok": False, "error": "download failed"})
                     return
             data = Path(fp).read_bytes()
-            self._send(200, data,
+            ctype = ("image/png" if fp.suffix == ".png"
+                     else "image/webp" if fp.suffix == ".webp" else "image/jpeg")
+            self._send(200, data, ctype=ctype,
                        headers={"Content-Disposition": f'attachment; filename="{Path(fp).name}"'})
         else:
             self._send(404, {"ok": False, "error": "not found",
@@ -303,7 +305,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             blobs.append((it.get("uuid", "f"), it.pop("file_b64")))
                 for name, b64 in blobs:
                     raw = _b64.b64decode(b64)
-                    saved = _fs.save_blob(f"{name}.jpg", raw)
+                    fname = (f"{res.get('uuid', 'file')}.jpg" if name == "file"
+                             else f"{name}.jpg")
+                    saved = _fs.save_blob(fname, raw)
                     if name == "file":
                         res["file"] = saved["path"] or res.get("file", "")
                         if saved["url"]:
@@ -389,6 +393,7 @@ def main():
         api.start()
         print("[*] engine ready (off-screen Chrome, port 9333)", flush=True)
     else:
+        api.local_run = False
         api.start(boot_engine=False)
         print("[*] api role: queue only (run worker.py where Chrome lives)",
               flush=True)

@@ -90,9 +90,23 @@ REPL commands (`flow.bat`): `<prompt>` `/model` `/seed` `/history`
   GET  /health (engine + session) /restart /session (login steps when dead)
   GET  /logs?limit=100                          -> daily append-only JSONL
   GET  /media/<uuid>                            -> image bytes
+  GET  /workers                                 -> online engine workers
 ```
 Jobs persist in `sessions/flow.db`; logs in `logs/flow-YYYYMMDD.jsonl`
 (kept indefinitely). Slow ops never block the server: poll the job.
+
+### 4c. Always-live hosting (Render API + home worker)
+
+The engine needs your logged-in Chrome profile, so it can't live on a
+server. Split-brain instead (see `DEPLOY.md`):
+- **Render** runs `flow_server.py` with `ROLE=api`: queue, media library,
+  logs, auth (`API_KEYS`), per-key rate limits. No browser, no Google login.
+- **Home PC** runs `python worker.py --api <render-url> --key <secret>`:
+  heartbeats, claims queued jobs, enforces the Google throttle (45s gaps,
+  daily caps, circuit breaker), uploads result bytes back.
+- Content systems call Render with `Authorization: Bearer <key>`; per-key
+  POST/GET minute limits return `429` + `Retry-After`. Files land in
+  `outputs/` (or S3/R2 when `S3_*` env is set, with public URLs).
 
 `flow_api.py` is the core: `PureHTTP` (reads/downloads) + `FlowEngine`
 (off-screen Chrome, port 9333) + `FlowAPI` (worker-thread facade) + REPL.

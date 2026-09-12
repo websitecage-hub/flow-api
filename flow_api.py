@@ -1363,6 +1363,8 @@ class FlowAPI:
         self._q = _queue.Queue()
         self._ready = _threading.Event()
         self._threading = _threading
+        # False on hosted API role: jobs only queue, a remote worker runs them
+        self.local_run = True
 
     def _worker(self):
         while True:
@@ -1423,6 +1425,8 @@ class FlowAPI:
 
         jid = _fs.new_job(kind, params)
         _fs.jlog("job_queued", job=jid, kind=kind)
+        if not self.local_run:
+            return jid  # hosted API role: remote worker claims via /worker/next
 
         def _runner():
             _fs.job_update(jid, status="running", event="started")
