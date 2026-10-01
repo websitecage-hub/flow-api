@@ -1366,13 +1366,14 @@ class FlowAPI:
         self._active = 0
         # False on hosted API role: jobs only queue, a remote worker runs them
         self.local_run = True
+        self.boot_error = ""
 
     def _worker(self):
         while True:
             fn, ev, res = self._q.get()
             try:
                 res["v"] = fn()
-            except Exception as e:  # noqa: BLE001
+            except BaseException as e:  # noqa: BLE001  (SystemExit is not Exception)
                 res["err"] = e
             finally:
                 ev.set()
@@ -1389,7 +1390,14 @@ class FlowAPI:
                 if not ev.wait(timeout):
                     raise TimeoutError("engine job timed out")
                 if "err" in res:
-                    raise res["err"]
+                    err = res["err"]
+                    if isinstance(err, SystemExit):
+                        raise RuntimeError(
+                            f"engine boot failed (exit {err.code}); "
+                            "no Chrome/profile here? hosted role should be 'api'")
+                    raise err
+                if "v" not in res:
+                    raise RuntimeError("engine task produced no result")
                 return res["v"]
             finally:
                 self._active -= 1
@@ -1411,10 +1419,22 @@ class FlowAPI:
         t = self._threading.Thread(target=self._worker, daemon=True)
         t.start()
         self._ready.set()
-        self.run(_boot, timeout=400)
+        self.boot_error = ""
+        try:
+            self.run(_boot, timeout=400)
+        except Exception as e:  # noqa: BLE001
+            # never let a boot failure kill the HTTP server: the API stays up
+            # and /health reports the problem. (On Render ROLE=api this path is
+            # not reached; on a misconfigured role it prevents exit(1) loops.)
+            self.boot_error = str(e)[:300]
+            print(f"[!] engine boot failed: {self.boot_error}", flush=True)
+            return {"ok": False, "project": "", "error": self.boot_error}
         st = load_state()
         pid = st.get("project_id", "")
-        if pid:
+        # Only probe the live project when a real engine is present (local
+        # role). On the hosted api role this would block boot on a slow Google
+        # round-trip and stall Render's health check -> deploy timeout/fail.
+        if self.engine is not None and pid:
             try:
                 if self.http.history(pid) is None:
                     print(f"[*] project {pid[:13]}.. unreachable", flush=True)
@@ -1511,25 +1531,36 @@ class FlowAPI:
                                  "resolution": resolution,
                                  "project_id": project_id}, job)
 
-    def session_info(self):
-        """Session/engine state + manual-login steps when dead."""
-        def job():
-            st = load_state()
+    def _base_info(self):
+        """Fast, non-blocking snapshot (no Google call, no worker queue).
+        Safe to serve on every health check: Render kills deploys when the
+        health path stalls on a slow upstream."""
+        st = load_state()
+        alive = False
+        try:
+            alive = bool(self.engine) and self.engine._cdp_alive()
+        except Exception:
             alive = False
-            try:
-                alive = bool(self.engine) and self.engine._cdp_alive()
-            except Exception:
-                alive = False
+        pid = st.get("project_id", "")
+        cookies_ready = COOKIES_FILE.exists()
+        return {"ok": True, "engine_alive": alive,
+                "project": pid, "model": st.get("model", "NARWHAL"),
+                "busy": self.is_busy(), "local_run": self.local_run,
+                "cookies_ready": cookies_ready,
+                "boot_error": getattr(self, "boot_error", "")}
+
+    def session_info(self):
+        """Deep session check (live Google probe). Slow by nature; use /health
+        for liveness and this /session only when a real answer is needed."""
+        def job():
+            out = self._base_info()
             sess = False
             try:
-                pid = st.get("project_id", "")
+                pid = out.get("project", "")
                 sess = bool(pid) and self.http.history(pid) is not None
             except Exception:
                 sess = False
-            out = {"ok": True, "engine_alive": alive, "session_ok": sess,
-                   "project": st.get("project_id", ""),
-                   "model": st.get("model", "NARWHAL"),
-                    "busy": self.is_busy()}
+            out["session_ok"] = sess
             if not sess:
                 out["login_steps"] = [
                     "1. Run: python -u -c \"from flow_api import FlowEngine; "
@@ -1545,8 +1576,8 @@ class FlowAPI:
         return self.run(job, timeout=120)
 
     def status(self):
-        """Health snapshot (alias of session_info, kept for /health)."""
-        return self.session_info()
+        """Fast health snapshot for /health (never blocks on Google)."""
+        return self._base_info()
 
     def restart(self):
         def job():

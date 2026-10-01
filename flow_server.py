@@ -366,9 +366,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 api = FlowAPI()
-ROLE = os.environ.get("ROLE", "all").strip().lower()  # all | api
+# all = local engine + API | api = queue only (hosted brain; worker elsewhere).
+# Explicit ROLE wins. When unset, infer: no Chrome/profile here => this must be
+# the hosted brain, so never try to boot an engine that can't exist.
+ROLE = os.environ.get("ROLE", "").strip().lower()
 if ROLE not in ("all", "api"):
-    ROLE = "all"
+    _has_engine = bool(flow_api.CHROME) and flow_api.PROFILE.exists()
+    ROLE = "all" if _has_engine else "api"
 
 
 class _Tee:
@@ -410,15 +414,26 @@ def main():
     print("=" * 60)
     print(f"  Google Flow HTTP API  (role={ROLE})")
     print("=" * 60)
-    if ROLE == "all":
-        print("[*] starting invisible engine...", flush=True)
-        api.start()
-        print("[*] engine ready (off-screen Chrome, port 9333)", flush=True)
-    else:
+    try:
+        if ROLE == "all":
+            print("[*] starting invisible engine...", flush=True)
+            r = api.start()
+            if r.get("ok"):
+                print("[*] engine ready (off-screen Chrome, port 9333)", flush=True)
+            else:
+                print(f"[!] engine unavailable: {r.get('error', '')}", flush=True)
+                print("    API is up in degraded mode; /health reports why.",
+                      flush=True)
+        else:
+            api.local_run = False
+            api.start(boot_engine=False)
+            print("[*] api role: queue only (run worker.py where Chrome lives)",
+                  flush=True)
+    except Exception as e:  # noqa: BLE001
+        # last-resort: never crash the container; serve so /health is reachable
         api.local_run = False
-        api.start(boot_engine=False)
-        print("[*] api role: queue only (run worker.py where Chrome lives)",
-              flush=True)
+        api.boot_error = str(e)[:300]
+        print(f"[!] boot failed: {api.boot_error} (serving degraded)", flush=True)
 
     server = http.server.ThreadingHTTPServer((host, port), Handler)
     print(f"[*] API listening on http://{host}:{port}", flush=True)

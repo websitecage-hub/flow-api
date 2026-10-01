@@ -14,6 +14,7 @@ reports/
 flow.log
 srv.live.log
 srv.*.log
+status.md
 
 # Python
 __pycache__/
