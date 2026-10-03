@@ -1,30 +1,51 @@
+# Fully self-hosted Flow API (browser engine inside the container).
+#
+# This replaces the previous split-brain blueprint (brain on Render + worker
+# on your PC). The Chrome profile lives on a Render Disk so it survives
+# redeploys.
 services:
   - type: web
     name: flow-api
     runtime: docker
-    plan: starter            # always-on (no sleep); needs paid plan for 24/7
+    dockerfilePath: ./Dockerfile.hosted
+    plan: starter            # headless Chromium needs RAM; free tier OOMs
     region: oregon
-    dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     autoDeploy: true
+    # Keeps the logged-in Google profile + generated images across deploys.
+    disk:
+      name: flow-data
+      mountPath: /data
+      sizeGB: 5
     envVars:
       - key: ROLE
-        value: api
+        value: all
       - key: FLOW_PROJECT
-        sync: false          # your Flow project uuid (from local state file)
+        sync: false          # your Flow project uuid
       - key: FLOW_MODEL
         value: NARWHAL
       - key: API_KEYS
-        sync: false          # e.g. cms1:secret1,cms2:secret2 (content systems)
+        sync: false          # cms1:secret1  (content systems send this)
       - key: RATE_POST_PER_MIN
         value: "20"
       - key: RATE_GET_PER_MIN
         value: "120"
-      # --- durable file storage (optional, recommended for always-live) ---
-      # Cloudflare R2 (free 10GB, S3 API). Without these, files live on the
-      # container disk (lost on redeploy unless a Render Disk is attached).
+      # Google throttle (protects the account, same knobs as local)
+      - key: FLOW_MIN_SUBMIT_INTERVAL
+        value: "45"
+      - key: FLOW_MAX_GENERATE_PER_DAY
+        value: "200"
+      - key: FLOW_MAX_UPSCALE_PER_DAY
+        value: "100"
+      # Optional: credentials for the one-time auto-login (see DEPLOY.md).
+      # Prefer doing the login once by hand via `render ssh` instead.
+      - key: FLOW_EMAIL
+        sync: false
+      - key: FLOW_PASSWORD
+        sync: false
+      # Optional: durable public image URLs (Cloudflare R2 free tier).
       - key: S3_ENDPOINT
-        sync: false          # e.g. https://<id>.r2.cloudflarestorage.com
+        sync: false
       - key: S3_BUCKET
         sync: false
       - key: S3_KEY
@@ -32,4 +53,4 @@ services:
       - key: S3_SECRET
         sync: false
       - key: S3_PUBLIC_BASE
-        sync: false          # e.g. https://pub-<id>.r2.dev
+        sync: false

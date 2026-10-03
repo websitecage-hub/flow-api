@@ -1,0 +1,35 @@
+# Fully self-hosted Flow API on Render (no local PC, no local browser).
+#
+# Why Docker + ROLE=all instead of the split-brain setup:
+#   Google Flow gates every write (generate/upscale) behind reCAPTCHA
+#   Enterprise. Tokens are minted only by a real browser, so the engine
+#   cannot live on a plain Python box. Here the browser runs INSIDE this
+#   container, which makes the whole API self-contained.
+#
+# Base image: Microsoft's Playwright image (Chromium + every system lib
+# Playwright needs already baked in). Pinned to the Playwright version so
+# the Python package and the browser binaries stay in sync.
+
+FROM mcr.microsoft.com/playwright:v1.40.0-noble
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ROLE=all \
+    FLOW_PROFILE=/data/profile \
+    FLOW_OUT=/data/outputs \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /app
+
+# Slim deps: the browser itself comes from the base image.
+COPY requirements.docker.txt .
+RUN pip install --no-cache-dir -r requirements.docker.txt
+
+COPY flow_api.py flow_server.py flow_store.py worker.py gen.py menu.py flow.py ./
+COPY start.sh login_helper.py ./
+
+# /data is the Render Disk mount (profile + images survive redeploys).
+RUN chmod +x start.sh && mkdir -p /data/profile /data/outputs /data/sessions /data/logs
+
+EXPOSE 8787
+CMD ["./start.sh"]

@@ -87,6 +87,14 @@ def _detect_chrome():
             w = _sh.which(name)
             if w:
                 return w
+        # Microsoft Playwright base image: bundled Chromium lives under
+        # /ms-playwright. Prefer the full chrome build over the headless shell.
+        import glob as _g
+        for pat in ("/ms-playwright/chromium-*/chrome-linux/chrome",
+                    "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell"):
+            hits = sorted(_g.glob(pat), reverse=True)
+            if hits:
+                return hits[0]
     for c in cands:
         if c and Path(c).exists():
             return c
@@ -570,7 +578,9 @@ class FlowEngine:
         if sys.platform.startswith("win"):
             args.append("--window-position=-32000,-32000")
         else:
-            args.append("--headless=new")
+            # Headless container: no sandbox, small /dev/shm, no GPU.
+            args += ["--headless=new", "--no-sandbox", "--disable-setuid-sandbox",
+                     "--disable-dev-shm-usage", "--disable-gpu"]
         args += ["--disable-background-timer-throttling",
                  "--disable-backgrounding-occluded-windows",
                  "--disable-renderer-backgrounding",
@@ -1441,7 +1451,26 @@ class FlowAPI:
                     pid = ""
             except Exception:
                 pid = ""
+        # Self-healing watchdog: if the headless Chrome dies, restart it. This
+        # is what keeps the hosted engine alive across Render restarts.
+        if boot_engine and self.engine is not None:
+            wt = self._threading.Thread(target=self._watchdog, daemon=True)
+            wt.start()
         return {"ok": True, "project": pid}
+
+    def _watchdog(self):
+        while True:
+            time.sleep(60)
+            try:
+                if self.engine is not None and not self.engine._cdp_alive():
+                    print("[watchdog] engine dead; restarting", flush=True)
+                    try:
+                        self.engine.restart()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[watchdog] restart failed: {str(e)[:120]}",
+                              flush=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def close(self):
         try:
