@@ -4,6 +4,19 @@ set -e
 # Persistent dirs (Render Disk mounted at /data)
 mkdir -p "$FLOW_PROFILE" "$FLOW_OUT" /data/sessions /data/logs
 
+# Locate the Playwright-installed Chromium explicitly and export it, so
+# flow_api's engine never has to guess the path (version suffix varies).
+CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name chrome -type f 2>/dev/null | head -1)
+if [ -z "$CHROME_BIN" ]; then
+  CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name headless_shell -type f 2>/dev/null | head -1)
+fi
+if [ -n "$CHROME_BIN" ]; then
+  export FLOW_CHROME="$CHROME_BIN"
+  echo "[start] using chromium: $CHROME_BIN"
+else
+  echo "[start] WARNING: no chromium binary found"
+fi
+
 # One-time seed: if a profile tarball URL is provided and the profile dir is
 # empty, download + extract it so you don't have to log in by hand again.
 if [ -n "$PROFILE_TAR_URL" ] && [ ! -d "$FLOW_PROFILE/Default" ]; then

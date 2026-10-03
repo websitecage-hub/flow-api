@@ -414,29 +414,38 @@ def main():
     print("=" * 60)
     print(f"  Google Flow HTTP API  (role={ROLE})")
     print("=" * 60)
-    try:
-        if ROLE == "all":
-            print("[*] starting invisible engine...", flush=True)
-            r = api.start()
-            if r.get("ok"):
-                print("[*] engine ready (off-screen Chrome, port 9333)", flush=True)
-            else:
-                print(f"[!] engine unavailable: {r.get('error', '')}", flush=True)
-                print("    API is up in degraded mode; /health reports why.",
-                      flush=True)
-        else:
-            api.local_run = False
-            api.start(boot_engine=False)
-            print("[*] api role: queue only (run worker.py where Chrome lives)",
-                  flush=True)
-    except Exception as e:  # noqa: BLE001
-        # last-resort: never crash the container; serve so /health is reachable
-        api.local_run = False
-        api.boot_error = str(e)[:300]
-        print(f"[!] boot failed: {api.boot_error} (serving degraded)", flush=True)
-
     server = http.server.ThreadingHTTPServer((host, port), Handler)
     print(f"[*] API listening on http://{host}:{port}", flush=True)
+    if ROLE == "all":
+        # Bind the port FIRST so Render's health check gets an instant 200,
+        # then boot the engine in the background (chromium launch can take
+        # 30-60s). /health reports engine state until it is ready.
+        print("[*] starting invisible engine (background)...", flush=True)
+
+        def _bg():
+            try:
+                r = api.start()
+                if r.get("ok"):
+                    print("[*] engine ready (off-screen Chrome)", flush=True)
+                else:
+                    print(f"[!] engine unavailable: {r.get('error', '')}",
+                          flush=True)
+            except Exception as e:  # noqa: BLE001
+                api.local_run = False
+                api.boot_error = str(e)[:300]
+                print(f"[!] boot failed: {api.boot_error}", flush=True)
+
+        threading.Thread(target=_bg, daemon=True).start()
+    else:
+        api.local_run = False
+        try:
+            api.start(boot_engine=False)
+        except Exception as e:  # noqa: BLE001
+            api.boot_error = str(e)[:300]
+            print(f"[!] api boot failed: {api.boot_error}", flush=True)
+        print("[*] api role: queue only (worker claims via /worker/next)",
+              flush=True)
+
     print("    POST /generate  {'prompt': 'a red fox', 'count': 1} -> 202 job",
           flush=True)
     try:
