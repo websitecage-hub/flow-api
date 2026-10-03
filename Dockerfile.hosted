@@ -26,7 +26,7 @@ COPY requirements.docker.txt .
 RUN pip install --no-cache-dir -r requirements.docker.txt
 
 COPY flow_api.py flow_server.py flow_store.py worker.py gen.py menu.py flow.py ./
-COPY start.sh login_helper.py ./
+COPY start.sh ./
 
 # /data is the Render Disk mount (profile + images survive redeploys).
 RUN chmod +x start.sh && mkdir -p /data/profile /data/outputs /data/sessions /data/logs
