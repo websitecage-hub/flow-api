@@ -87,10 +87,13 @@ def _detect_chrome():
             w = _sh.which(name)
             if w:
                 return w
-        # Microsoft Playwright base image: bundled Chromium lives under
-        # /ms-playwright. Prefer the full chrome build over the headless shell.
+        # Playwright-installed Chromium (Docker build runs
+        # `playwright install chromium`, landing in ~/.cache/ms-playwright).
         import glob as _g
-        for pat in ("/ms-playwright/chromium-*/chrome-linux/chrome",
+        home = os.path.expanduser("~")
+        for pat in (f"{home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
+                    f"{home}/.cache/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
+                    "/ms-playwright/chromium-*/chrome-linux/chrome",
                     "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell"):
             hits = sorted(_g.glob(pat), reverse=True)
             if hits:
