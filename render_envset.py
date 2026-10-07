@@ -18,7 +18,7 @@ vars_ = [
     {"key": "ROLE", "value": "api"},
     {"key": "FLOW_PROJECT", "value": "4124a6cc-e936-4354-b569-b5a08fdfec0b"},
     {"key": "FLOW_MODEL", "value": "NARWHAL"},
-    {"key": "API_KEYS", "value": "cms1:c2373760c1a44c761f47b489fa847cc5"},
+    {"key": "API_KEYS", "value": os.environ.get("FLOW_API_KEYS", "")},
     {"key": "RATE_POST_PER_MIN", "value": "20"},
     {"key": "RATE_GET_PER_MIN", "value": "120"},
 ]

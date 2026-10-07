@@ -34,7 +34,16 @@ import urllib.parse
 from pathlib import Path
 
 import flow_api
-from flow_api import FlowAPI, load_state, save_state
+from flow_api import load_state, save_state
+
+# Engine selection: FLOW_ENGINE=headless runs the chrome-headless-shell engine
+# (single process, ~120 MB) which fits Render's free 512 MB tier. Default
+# keeps the original full-Chrome engine.
+if os.environ.get("FLOW_ENGINE", "").strip().lower() == "headless":
+    import flow_api_headless as flow_api  # noqa: F811
+    from flow_api_headless import FlowAPI, load_state, save_state  # noqa: F401
+else:
+    from flow_api import FlowAPI  # noqa: F401
 
 flow_api._load_dotenv()
 

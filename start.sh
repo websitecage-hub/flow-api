@@ -4,9 +4,14 @@ set -e
 # Persistent dirs (Render Disk mounted at /data)
 mkdir -p "$FLOW_PROFILE" "$FLOW_OUT" /data/sessions /data/logs
 
-# Locate the Playwright-installed Chromium explicitly and export it, so
-# flow_api's engine never has to guess the path (version suffix varies).
-CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name chrome -type f 2>/dev/null | head -1)
+# Locate the browser binary and export it, so flow_api's engine never has to
+# guess the path. FLOW_ENGINE=headless -> the tiny single-process
+# chrome-headless-shell (~120 MB, fits Render free 512 MB); else full Chromium.
+if [ "${FLOW_ENGINE}" = "headless" ]; then
+  CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name chrome-headless-shell -type f 2>/dev/null | head -1)
+else
+  CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name chrome -type f 2>/dev/null | head -1)
+fi
 if [ -z "$CHROME_BIN" ]; then
   CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name headless_shell -type f 2>/dev/null | head -1)
 fi

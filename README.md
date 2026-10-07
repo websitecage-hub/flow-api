@@ -95,21 +95,36 @@ REPL commands (`flow.bat`): `<prompt>` `/model` `/seed` `/history`
 Jobs persist in `sessions/flow.db`; logs in `logs/flow-YYYYMMDD.jsonl`
 (kept indefinitely). Slow ops never block the server: poll the job.
 
-### 4c. Always-live hosting (Render API + home worker)
+### 4c. Hosting — SELF-CONTAINED on Render FREE tier (512 MB)
 
-The engine needs your logged-in Chrome profile, so it can't live on a
-server. Split-brain instead (see `DEPLOY.md`):
-- **Render** runs `flow_server.py` with `ROLE=api`: queue, media library,
-  logs, auth (`API_KEYS`), per-key rate limits. No browser, no Google login.
-- **Home PC** runs `python worker.py --api <render-url> --key <secret>`:
-  heartbeats, claims queued jobs, enforces the Google throttle (45s gaps,
-  daily caps, circuit breaker), uploads result bytes back.
-- Content systems call Render with `Authorization: Bearer <key>`; per-key
-  POST/GET minute limits return `429` + `Retry-After`. Files land in
-  `outputs/` (or S3/R2 when `S3_*` env is set, with public URLs).
+**This is now the recommended path** and replaces the old split-brain
+(Render brain + home-PC worker), which existed only because the engine was
+thought not to fit 512 MB. It fits — with the right binary.
 
-`flow_api.py` is the core: `PureHTTP` (reads/downloads) + `FlowEngine`
-(off-screen Chrome, port 9333) + `FlowAPI` (worker-thread facade) + REPL.
+| engine | RSS with flow.google.com loaded |
+|---|---|
+| full Chrome `--headless=new` (old `flow_api.FlowEngine`) | **1213 MB** |
+| `chrome-headless-shell` (`flow_headless.py`) | **115 MB** (118 peak minting) |
+
+`chrome-headless-shell` is Chrome's *lightweight* headless binary (single
+process). It runs the whole Angular app and mints reCAPTCHA Enterprise
+tokens fine. So the API — engine included — runs on free Render:
+
+```
+FLOW_ENGINE=headless  # flow_server.py -> flow_api_headless.FlowAPI
+Dockerfile.headless   # installs chromium-headless-shell only
+render.yaml           # plan: free
+```
+
+See **`DEPLOY-FREE.md`**. The only free-tier caveat: no persistent disk, so
+the logged-in profile is seeded on boot from `PROFILE_TAR_URL`.
+
+The old split-brain is still available if you want it (see `DEPLOY.md`):
+`ROLE=api` on Render + `python worker.py --api <url> --key <secret>` at home.
+
+`flow_api.py` remains the full-Chrome engine: `PureHTTP` (reads/downloads) +
+`FlowEngine` (off-screen Chrome, port 9333) + `FlowAPI` (worker-thread
+facade) + REPL. `flow_headless.py` is the small engine that fits free tier.
 `flow.py`/`flow.bat`/`flow.sh` bootstrap the venv automatically.
 
 ### 4c. Run on any PC

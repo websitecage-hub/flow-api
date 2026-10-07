@@ -1,5 +1,9 @@
-# Slim runtime deps for the Render API role (no browser here).
-# boto3/pillow stay local-dev only (requirements.txt); server imports them
-# lazily / not at all, so Docker stays small and builds stay fast.
+# Slim runtime deps for the Render image (browser comes from Playwright's
+# install, not from Python wheels). boto3/pillow stay local-dev only
+# (requirements.txt); server imports them lazily / not at all.
 playwright>=1.40
 curl_cffi>=0.5
+
+# NOTE for FLOW_ENGINE=headless: the Dockerfile runs
+#   playwright install --with-deps chromium-headless-shell
+# which pulls the tiny single-process browser (~120 MB RSS) used on free tier.

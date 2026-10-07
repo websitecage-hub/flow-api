@@ -1,0 +1,33 @@
+# Flow API — SELF-CONTAINED on Render FREE tier (512 MB RAM).
+#
+# Runs flow_server.py with the chrome-headless-shell engine inline.
+# Measured: 115 MB with flow.google.com loaded, 118 MB peak while minting
+# a reCAPTCHA Enterprise token. No home PC worker required.
+#
+# The heavy "--headless=new" Chrome used by the old Dockerfile.hosted needs
+# ~1.2 GB and is why the repo previously concluded "free tier OOMs".
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ROLE=all \
+    FLOW_ENGINE=headless \
+    FLOW_PROFILE=/data/profile \
+    FLOW_OUT=/data/outputs \
+    FLOW_MEM_GUARD_MB=420
+
+WORKDIR /app
+
+COPY requirements.docker.txt .
+RUN pip install --no-cache-dir -r requirements.docker.txt \
+    && playwright install --with-deps chromium
+# `chromium` also ships `chrome-headless-shell` (the ~120 MB single-process
+# binary start.sh selects when FLOW_ENGINE=headless).
+
+COPY flow_api.py flow_headless.py flow_api_headless.py flow_server.py \
+     flow_store.py worker.py gen.py menu.py flow.py ./
+COPY start.sh ./
+
+RUN chmod +x start.sh && mkdir -p /data/profile /data/outputs /data/sessions /data/logs
+EXPOSE 8787
+CMD ["./start.sh"]

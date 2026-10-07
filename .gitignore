@@ -11,15 +11,19 @@ profile-copy/
 outputs/
 logs/
 reports/
+recon/
 flow.log
 srv.live.log
 srv.*.log
 status.md
+*.tgz
+profile.tgz
 
 # Python
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 venv/
 
 # Outputs

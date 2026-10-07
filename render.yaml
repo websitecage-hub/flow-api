@@ -1,56 +1,50 @@
-# Fully self-hosted Flow API (browser engine inside the container).
+# Flow API — SELF-CONTAINED on Render FREE tier (512 MB RAM).
 #
-# This replaces the previous split-brain blueprint (brain on Render + worker
-# on your PC). The Chrome profile lives on a Render Disk so it survives
-# redeploys.
+# Runs flow_server.py with the chrome-headless-shell engine inline.
+# Measured: 115 MB with flow.google.com loaded, 118 MB peak while minting
+# a reCAPTCHA Enterprise token. No home PC worker required.
+#
+# The heavy "--headless=new" Chrome used by the old Dockerfile.hosted needs
+# ~1.2 GB and is why the repo previously concluded "free tier OOMs".
+#
+# NOTE: Render free instances have NO persistent disk, so a logged-in Flow
+# profile cannot be stored across deploys. Seed it with PROFILE_TAR_URL
+# (a tarball of a logged-in profile) — see DEPLOY-FREE.md.
 services:
   - type: web
     name: flow-api
     runtime: docker
-    dockerfilePath: ./Dockerfile.hosted
-    plan: starter            # headless Chromium needs RAM; free tier OOMs
+    dockerfilePath: ./Dockerfile.headless
+    plan: free                    # 512 MB — the headless engine fits
     region: oregon
     healthCheckPath: /health
     autoDeploy: true
-    # Keeps the logged-in Google profile + generated images across deploys.
-    disk:
-      name: flow-data
-      mountPath: /data
-      sizeGB: 5
     envVars:
       - key: ROLE
         value: all
+      - key: FLOW_ENGINE
+        value: headless
+      - key: FLOW_PROFILE
+        value: /app/profile-copy  # free tier: no /data disk; seeded from tarball
+      - key: FLOW_OUT
+        value: /app/outputs
+      - key: FLOW_MEM_GUARD_MB
+        value: "420"
       - key: FLOW_PROJECT
-        sync: false          # your Flow project uuid
+        sync: false               # your Flow project uuid
       - key: FLOW_MODEL
         value: NARWHAL
       - key: API_KEYS
-        sync: false          # cms1:secret1  (content systems send this)
+        sync: false               # cms1:secret1  (content systems send this)
+      - key: PROFILE_TAR_URL
+        sync: false               # tarball of a logged-in browser profile
       - key: RATE_POST_PER_MIN
         value: "20"
       - key: RATE_GET_PER_MIN
         value: "120"
-      # Google throttle (protects the account, same knobs as local)
       - key: FLOW_MIN_SUBMIT_INTERVAL
         value: "45"
       - key: FLOW_MAX_GENERATE_PER_DAY
         value: "200"
       - key: FLOW_MAX_UPSCALE_PER_DAY
         value: "100"
-      # Optional: credentials for the one-time auto-login (see DEPLOY.md).
-      # Prefer doing the login once by hand via `render ssh` instead.
-      - key: FLOW_EMAIL
-        sync: false
-      - key: FLOW_PASSWORD
-        sync: false
-      # Optional: durable public image URLs (Cloudflare R2 free tier).
-      - key: S3_ENDPOINT
-        sync: false
-      - key: S3_BUCKET
-        sync: false
-      - key: S3_KEY
-        sync: false
-      - key: S3_SECRET
-        sync: false
-      - key: S3_PUBLIC_BASE
-        sync: false
