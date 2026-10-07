@@ -63,19 +63,49 @@ STATE_FILE = ROOT / "sessions" / "flow_api_state.json"
 COOKIES_FILE = ROOT / "sessions" / "flow.cookies.full.json"
 MEM_GUARD_MB = int(os.environ.get("FLOW_MEM_GUARD_MB", "420"))
 
-# Wire enums (README §1)
-ASPECT_WIRE = {"1:1": 1, "9:16": 2, "16:9": 3, "3:4": 4, "4:3": 5}
+# ── model registry ───────────────────────────────────────────────
+# Wire codes are Google's internal names sent in the ogiZ0b payload
+# (imageModelName). Verified against the Flow app; NARWHAL/HARBOR_SEAL/
+# GEM_PIX_2 were confirmed live. Nano Banana 2.1 went GA 2026-10-06 and
+# supersedes Nano Banana 2 (NARWHAL), which shuts down 2026-10-29 — its
+# Flow wire code is captured live by capture_ui()/capture_chunks().
 MODEL_DISPLAY = {
-    "NANO BANANA 2": "NARWHAL", "NANO BANANA 2 LITE": "HARBOR_SEAL",
-    "NANO BANANA PRO": "GEM_PIX_2", "NARWHAL": "NARWHAL",
-    "HARBOR_SEAL": "HARBOR_SEAL", "GEM_PIX_2": "GEM_PIX_2",
+    "NANO BANANA 2.1": "NANO_BANANA_21",
+    "NANO BANANA 2.1 LITE": "NANO_BANANA_21_LITE",
+    "NANO BANANA 2": "NARWHAL",
+    "NANO BANANA 2 LITE": "HARBOR_SEAL",
+    "NANO BANANA PRO": "GEM_PIX_2",
+    "NANO BANANA": "NARWHAL",
 }
+MODEL_WIRE = {
+    "NARWHAL": {"label": "Nano Banana 2", "gemini": "gemini-3.1-flash-image",
+                "note": "deprecated; shuts down 2026-10-29"},
+    "HARBOR_SEAL": {"label": "Nano Banana 2 Lite",
+                    "gemini": "gemini-3.1-flash-lite-image"},
+    "GEM_PIX_2": {"label": "Nano Banana Pro", "gemini": "gemini-3-pro-image"},
+    "NANO_BANANA_21": {"label": "Nano Banana 2.1",
+                       "gemini": "gemini-nano-banana-2.1", "assumed": True},
+    "NANO_BANANA_21_LITE": {"label": "Nano Banana 2.1 Lite",
+                            "gemini": "gemini-nano-banana-2.1-lite",
+                            "assumed": True},
+}
+MODELS = list(MODEL_DISPLAY.values())
+
+# Aspect ratio: Flow sends an integer enum (verified 1:1→1, 9:16→2, 16:9→3,
+# 3:4→4, 4:3→5). Nano Banana 2.1 also supports 3:2/2:3/4:5/5:4/21:9 etc.
+# — those get their enum numbers captured from the live UI (capture_ui()).
+ASPECT_WIRE = {"1:1": 1, "9:16": 2, "16:9": 3, "3:4": 4, "4:3": 5,
+               "3:2": 6, "2:3": 7, "4:5": 8, "5:4": 9, "21:9": 10}
 
 
 def norm_model(name):
+    """Human/model name -> wire code. Accepts wire codes unchanged."""
     if not name:
         return "NARWHAL"
-    return MODEL_DISPLAY.get(str(name).strip().upper(), str(name).strip().upper())
+    k = str(name).strip().upper()
+    if k in MODEL_WIRE:
+        return k
+    return MODEL_DISPLAY.get(k, k.replace(" ", "_"))
 
 
 def _log(msg):
@@ -252,7 +282,45 @@ class HeadlessEngine:
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         _log(f"[*] headless-shell up ({Path(self.exe).name}), "
              f"RSS {rss_mb_of(str(PROFILE)):.0f} MB")
+        self._inject_cookies()
         return True
+
+    def _inject_cookies(self):
+        """If FLOW_COOKIES_JSON (a JSON array, or base64 of it) is set, add
+        those cookies to the context. Phone-friendly: you can paste the
+        cookie export straight into the Render env var."""
+        raw = os.environ.get("FLOW_COOKIES_JSON", "").strip()
+        if not raw:
+            return
+        import base64
+        try:
+            if not raw.lstrip().startswith("["):
+                raw = base64.b64decode(raw).decode("utf-8")
+            jar = json.loads(raw)
+        except Exception as e:
+            _log(f"[!] FLOW_COOKIES_JSON unparseable: {str(e)[:120]}")
+            return
+        n = 0
+        for c in jar if isinstance(jar, list) else []:
+            try:
+                dom = c.get("domain", "") or ".google.com"
+                self.ctx.add_cookies([{
+                    "name": c["name"], "value": c["value"], "domain": dom,
+                    "path": c.get("path", "/"),
+                    "expires": c.get("expirationDate") or c.get("expires") or -1,
+                    "httpOnly": bool(c.get("httpOnly")),
+                    "secure": bool(c.get("secure", True)),
+                    "sameSite": "None",
+                }])
+                n += 1
+            except Exception:
+                pass
+        _log(f"[*] injected {n} cookies from FLOW_COOKIES_JSON")
+        try:
+            self.page.reload(timeout=45000, wait_until="commit")
+            self._pump(seconds=6)
+        except Exception:
+            pass
 
     def goto_app(self, path: str = "/"):
         url = FLOW + path
@@ -443,8 +511,101 @@ class HeadlessEngine:
         Path(out_dir, "chunk_urls.json").write_text(json.dumps(js, indent=1))
         return js
 
+    # ── full UI/options scrape ───────────────────────────────────
+    def capture_ui(self, out_dir: str = "recon") -> dict:
+        """Open every composer menu on the live app and map ALL options:
+        models (incl. Nano Banana 2.1), aspect ratios, count, resolutions.
+        Returns a JSON-serialisable dict of what was actually on screen.
+
+        Needs a logged-in profile (the composer only exists when signed in).
+        """
+        Path(out_dir).mkdir(exist_ok=True)
+        pid = load_state().get("project_id", "")
+        self.goto_app(f"/u/1/project/{pid}" if pid else "/")
+        self._pump(seconds=20)
+
+        JS = r"""() => {
+          const T = (e) => (e.innerText || e.textContent || '').trim();
+          const vis = (e) => { const r=e.getBoundingClientRect();
+                               return r.width>0 && r.height>0; };
+          const out = {url: location.href, title: document.title};
+          // composer trigger buttons (the chips row above the text box)
+          out.triggers = [...document.querySelectorAll('button,[role=button]')]
+             .filter(e => vis(e) && /nano banana|model|aspect|ratio|x[1-4]|1:1|16:9|resolution|2K|4K/i.test(T(e)))
+             .map(T).filter((v,i,a)=>a.indexOf(v)===i).slice(0,40);
+          // any open overlay panes (menus)
+          const panes = [...document.querySelectorAll('.cdk-overlay-pane,[role=menu],[role=listbox],mat-menu,mat-bottom-sheet-container')];
+          out.panes = panes.map(p => ({
+            role: p.getAttribute('role') || p.tagName,
+            items: [...p.querySelectorAll('button,[role=menuitem],[role=option],mat-option,li')]
+                     .map(T).filter(Boolean).slice(0,60)
+          }));
+          // model names anywhere in the DOM text
+          const body = document.body ? document.body.innerText : '';
+          out.modelMentions = (body.match(/Nano Banana[^\n]{0,30}/gi) || [])
+                                .map(s=>s.trim()).filter((v,i,a)=>a.indexOf(v)===i);
+          out.aspectMentions = (body.match(/\b\d{1,2}:\d{1,2}\b/g) || [])
+                                .filter((v,i,a)=>a.indexOf(v)===i);
+          out.resolutionMentions = (body.match(/\b[124]K\b/g) || [])
+                                .filter((v,i,a)=>a.indexOf(v)===i);
+          return out;
+        }"""
+        report = {"engine_rss_mb": round(rss_mb_of(str(PROFILE)), 1)}
+
+        def _snap(tag):
+            try:
+                d = self.page.evaluate(JS)
+                report[tag] = d
+            except Exception as e:
+                report[tag] = {"error": str(e)[:200]}
+
+        _snap("composer_default")
+        # click each trigger and snapshot the resulting menu
+        try:
+            n = self.page.evaluate(
+                "() => document.querySelectorAll('[contenteditable=true]').length")
+            report["composer_present"] = n
+            trig = self.page.evaluate("""() => {
+              const T=(e)=>(e.innerText||'').trim();
+              const vis=(e)=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0;};
+              const btns=[...document.querySelectorAll('button,[role=button]')]
+                .filter(e=>vis(e) && /Nano Banana|aspect|ratio|16:9|1:1|4K|2K|x[1-4]/i.test(T(e)));
+              return btns.map(e=>T(e)).slice(0,12);
+            }""")
+            report["trigger_labels"] = trig
+            for i in range(min(6, len(trig or []))):
+                try:
+                    self.page.evaluate(f"""() => {{
+                      const T=(e)=>(e.innerText||'').trim();
+                      const vis=(e)=>{{const r=e.getBoundingClientRect();return r.width>0&&r.height>0;}};
+                      const btns=[...document.querySelectorAll('button,[role=button]')]
+                        .filter(e=>vis(e) && /Nano Banana|aspect|ratio|16:9|1:1|4K|2K|x[1-4]/i.test(T(e)));
+                      if (btns[{i}]) btns[{i}].click();
+                    }}""")
+                    self._pump(seconds=3)
+                    _snap(f"menu_{i}")
+                    self.page.keyboard.press("Escape")
+                    self._pump(seconds=2)
+                except Exception as e:
+                    report[f"menu_{i}"] = {"click_error": str(e)[:120]}
+        except Exception as e:
+            report["trigger_error"] = str(e)[:200]
+
+        Path(out_dir, "ui_options.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+        _log(f"[*] UI options -> {out_dir}/ui_options.json")
+        return report
+
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Flow headless-shell engine")
+    ap.add_argument("--capture-chunks", action="store_true",
+                    help="dump the app's JS chunk URLs (needs login)")
+    ap.add_argument("--capture-ui", action="store_true",
+                    help="scrape all composer UI options/models (needs login)")
+    ap.add_argument("--out", default="recon")
+    a = ap.parse_args()
     exe = detect_headless_shell()
     print("headless shell:", exe or "NOT FOUND")
     if not exe:
@@ -452,9 +613,15 @@ if __name__ == "__main__":
     eng = HeadlessEngine()
     eng.start()
     try:
-        print("url:", eng.goto_app("/"))
-        print("mint:", (eng.mint("GENERATE") or "")[:12], "...")
-        print("credits:", eng.credits())
-        print("rss:", round(rss_mb_of(str(PROFILE)), 1), "MB")
+        if a.capture_chunks:
+            print("chunks:", eng.capture_chunks(a.out))
+        elif a.capture_ui:
+            r = eng.capture_ui(a.out)
+            print(json.dumps(r, indent=1)[:4000])
+        else:
+            print("url:", eng.goto_app("/"))
+            print("mint:", (eng.mint("GENERATE") or "")[:12], "...")
+            print("credits:", eng.credits())
+            print("rss:", round(rss_mb_of(str(PROFILE)), 1), "MB")
     finally:
         eng.close()

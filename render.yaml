@@ -38,6 +38,8 @@ services:
         sync: false               # cms1:secret1  (content systems send this)
       - key: PROFILE_TAR_URL
         sync: false               # tarball of a logged-in browser profile
+      - key: FLOW_COOKIES_JSON
+        sync: false               # OR: base64 cookie export (phone-friendly)
       - key: RATE_POST_PER_MIN
         value: "20"
       - key: RATE_GET_PER_MIN

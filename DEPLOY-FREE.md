@@ -40,25 +40,53 @@ Optional: `PROFILE_TAR_URL` — see step 3.
 ## 3. The one thing free tier can't do: keep a login
 
 Render free instances have **no persistent disk**, so the logged-in browser
-profile is wiped on every deploy/restart. Options:
+profile is wiped on every deploy/restart. Pick whichever is easiest for you.
 
-- **PROFILE_TAR_URL (recommended):** put a tarball of a logged-in profile
-  somewhere reachable (private GitHub release, S3/R2, your own host) and set
-  `PROFILE_TAR_URL`. `start.sh` unpacks it into `FLOW_PROFILE` on boot.
+### Option A — cookies only (BEST FROM A PHONE)
 
-  Build the tarball from a machine where you logged in to flow.google.com once:
+No PC needed. You need the Google cookies for an account already signed in to
+flow.google.com. Get them on your phone:
 
-  ```bash
-  # profile dir is FLOW_PROFILE (default ./profile-copy)
-  tar -czf profile.tgz -C profile-copy .
-  # upload profile.tgz somewhere private, set PROFILE_TAR_URL to its URL
-  ```
+1. Install a cookie-export extension in your phone browser (e.g. "Cookie-Editor"
+   in Kiwi/Firefox for Android; on iOS use a desktop-mode browser), or open
+   DevTools remotely.
+2. Go to `https://flow.google.com` (signed in) and **Export cookies as JSON**.
+   You must include the `SID/HSID/SSID/APISID/SAPISID` family plus
+   `__Secure-1PSID`, `__Secure-3PSID` and `__Secure-next-auth.session-token`.
+3. Turn it into the env value:
 
-- **Or** seed cookies only: set `FLOW_COOKIES_JSON` (or drop a
-  `sessions/flow.cookies.full.json`) — enough for reads, not for writes.
+   ```bash
+   python import_cookies.py devtools-cookies.json
+   # prints a base64 blob -> paste into Render env FLOW_COOKIES_JSON
+   ```
 
-Either way, treat the profile tarball as a **secret** (it contains live Google
-session cookies). Never commit it.
+   Or, straight from a "Copy as cURL" cookie header:
+
+   ```bash
+   python import_cookies.py --header "SID=...; HSID=...; SSID=...; ..."
+   ```
+
+4. Set `FLOW_COOKIES_JSON` on Render (base64 is fine — the engine decodes it).
+   On boot it injects them; reads (history/credits/options) then work.
+
+> Reads work from cookies alone. Generation may additionally require the
+> profile's reCAPTCHA/account state — if `/generate` still errors after cookies,
+> use Option B for a stored profile.
+
+### Option B — full profile tarball
+
+Needs one machine where you logged in to flow.google.com once:
+
+```bash
+# profile dir is FLOW_PROFILE (default ./profile-copy)
+tar -czf profile.tgz -C profile-copy .
+# upload profile.tgz somewhere private, set PROFILE_TAR_URL to its URL
+```
+
+`start.sh` unpacks it into `FLOW_PROFILE` on boot.
+
+Either way, treat cookies/tarball as a **secret** (live Google session). Never
+commit them.
 
 ## 4. Verify
 
