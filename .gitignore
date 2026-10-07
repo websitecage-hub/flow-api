@@ -8,6 +8,7 @@ creds.json
 
 # Machine-local runtime data — never commit
 profile-copy/
+profile-*            # any browser-profile dir (holds live session cookies)
 outputs/
 logs/
 reports/

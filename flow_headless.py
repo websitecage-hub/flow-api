@@ -63,33 +63,52 @@ STATE_FILE = ROOT / "sessions" / "flow_api_state.json"
 COOKIES_FILE = ROOT / "sessions" / "flow.cookies.full.json"
 MEM_GUARD_MB = int(os.environ.get("FLOW_MEM_GUARD_MB", "420"))
 
-# ── model registry ───────────────────────────────────────────────
-# Wire codes are Google's internal names sent in the ogiZ0b payload
-# (imageModelName). Verified against the Flow app; NARWHAL/HARBOR_SEAL/
-# GEM_PIX_2 were confirmed live. Nano Banana 2.1 went GA 2026-10-06 and
-# supersedes Nano Banana 2 (NARWHAL), which shuts down 2026-10-29 — its
-# Flow wire code is captured live by capture_ui()/capture_chunks().
+# ── model registry (VERIFIED against the live app 2026-10-07) ─────
+# Wire codes come from the app's own enum (FlowModel enum in the auth-gated
+# bundle) and the real ogiZ0b request captured from the app:
+#   ogiZ0b -> /FlowService.BatchGenerateImages
+#   request[5] = imageModelKey  (NOT imageModelName)
+#   request[4] = aspectRatio int (16:9→3, 4:3→5, 1:1→1, 3:4→4, 9:16→2)
+#   recaptcha action for images = "IMAGE_GENERATION" (not "GENERATE")
 MODEL_DISPLAY = {
-    "NANO BANANA 2.1": "NANO_BANANA_21",
-    "NANO BANANA 2.1 LITE": "NANO_BANANA_21_LITE",
+    "NANO BANANA 2.1": "BELUGA",
+    "NANO BANANA 2.1 THINKING LOW": "BELUGA_THINKING_LOW",
+    "NANO BANANA 2.1 THINKING MED": "BELUGA_THINKING_MED",
+    "NANO BANANA 2.1 THINKING HIGH": "BELUGA_THINKING_HIGH",
     "NANO BANANA 2": "NARWHAL",
     "NANO BANANA 2 LITE": "HARBOR_SEAL",
     "NANO BANANA PRO": "GEM_PIX_2",
     "NANO BANANA": "NARWHAL",
 }
+# Full image-model enum from the bundle (id -> code)
+MODEL_ENUM = {
+    20: "IMAGEN_3_5_FAST", 21: "IMAGEN_3_5", 23: "GEM_PIX", 24: "R2I",
+    25: "GEM_PIX_2", 26: "GEM_PIX_2_UPSAMPLE_2K", 27: "GEM_PIX_2_UPSAMPLE_4K",
+    28: "GEM_PIX_2_BOTTLE", 29: "NARWHAL", 30: "GEM_PIX_2_GEOGENIE",
+    31: "HARBOR_SEAL", 32: "GEM_PIX_VERTEX", 33: "GEM_PIX_2_VERTEX",
+    34: "GEM_PIX_PRO_VERTEX", 35: "GEM_PIX_2_LITE_VERTEX", 36: "BELUGA",
+    37: "BELUGA_THINKING_LOW", 38: "BELUGA_THINKING_MED",
+    39: "BELUGA_THINKING_HIGH", 40: "BELUGA_VERTEX",
+}
+# Models the Flow UI actually offers for image generation (from the app's
+# own master list: "GEM_PIX_2 ... NARWHAL HARBOR_SEAL BELUGA BELUGA_THINKING_*")
 MODEL_WIRE = {
+    "BELUGA": {"label": "Nano Banana 2.1", "gemini": "gemini-nano-banana-2.1",
+               "default": True},
+    "BELUGA_THINKING_LOW": {"label": "Nano Banana 2.1 (Thinking Low)",
+                            "gemini": "gemini-nano-banana-2.1"},
+    "BELUGA_THINKING_MED": {"label": "Nano Banana 2.1 (Thinking Med)",
+                            "gemini": "gemini-nano-banana-2.1"},
+    "BELUGA_THINKING_HIGH": {"label": "Nano Banana 2.1 (Thinking High)",
+                             "gemini": "gemini-nano-banana-2.1"},
+    "GEM_PIX_2": {"label": "Nano Banana Pro", "gemini": "gemini-3-pro-image"},
     "NARWHAL": {"label": "Nano Banana 2", "gemini": "gemini-3.1-flash-image",
                 "note": "deprecated; shuts down 2026-10-29"},
     "HARBOR_SEAL": {"label": "Nano Banana 2 Lite",
                     "gemini": "gemini-3.1-flash-lite-image"},
-    "GEM_PIX_2": {"label": "Nano Banana Pro", "gemini": "gemini-3-pro-image"},
-    "NANO_BANANA_21": {"label": "Nano Banana 2.1",
-                       "gemini": "gemini-nano-banana-2.1", "assumed": True},
-    "NANO_BANANA_21_LITE": {"label": "Nano Banana 2.1 Lite",
-                            "gemini": "gemini-nano-banana-2.1-lite",
-                            "assumed": True},
 }
-MODELS = list(MODEL_DISPLAY.values())
+MODELS = list(MODEL_WIRE.keys())
+DEFAULT_MODEL = "BELUGA"
 
 # Aspect ratio: Flow sends an integer enum (verified 1:1→1, 9:16→2, 16:9→3,
 # 3:4→4, 4:3→5). Nano Banana 2.1 also supports 3:2/2:3/4:5/5:4/21:9 etc.
@@ -211,8 +230,15 @@ JS_RPC = """async ({rpcid, payload, at, pid}) => {
 }"""
 
 JS_SCRAPE_AT = """() => {
+  // Google apps expose the batchexecute XSRF token as WIZ_global_data.SNlM0e.
+  try {
+    if (window.WIZ_global_data && window.WIZ_global_data.SNlM0e)
+      return window.WIZ_global_data.SNlM0e;
+  } catch (e) {}
   const h = document.documentElement.innerHTML;
-  const m = h.match(/AIQ-[A-Za-z0-9_\\-]{20,80}:\\d{10,20}/);
+  let m = h.match(/["']?SNlM0e["']?\\s*[:=]\\s*["']([A-Za-z0-9_\\-]+:\\d{10,20})["']/);
+  if (m) return m[1];
+  m = h.match(/AIQ-[A-Za-z0-9_\\-]{20,80}:\\d{10,20}/);
   return m ? m[0] : '';
 }"""
 
@@ -304,13 +330,19 @@ class HeadlessEngine:
         for c in jar if isinstance(jar, list) else []:
             try:
                 dom = c.get("domain", "") or ".google.com"
+                secure = bool(c.get("secure", True))
+                name = c["name"]
+                # __Secure- cookies MUST be secure or the browser drops them;
+                # SameSite=None is only legal when secure.
+                if name.startswith("__Secure-") or name.startswith("__Host-"):
+                    secure = True
                 self.ctx.add_cookies([{
-                    "name": c["name"], "value": c["value"], "domain": dom,
+                    "name": name, "value": c["value"], "domain": dom,
                     "path": c.get("path", "/"),
                     "expires": c.get("expirationDate") or c.get("expires") or -1,
                     "httpOnly": bool(c.get("httpOnly")),
-                    "secure": bool(c.get("secure", True)),
-                    "sameSite": "None",
+                    "secure": secure,
+                    "sameSite": "None" if secure else "Lax",
                 }])
                 n += 1
             except Exception:
@@ -398,41 +430,48 @@ class HeadlessEngine:
         data = self.call("Zzl0ze", [f"projects/{pid}", None, None, None, [1]], pid)
         return data
 
-    # ── generation / upscale (payload from the app's own bundle) ──
-    # The write RPCs (ogiZ0b/SPrCad) live in auth-gated lazy chunks; the
-    # payload below is the documented shape (README §1). With a logged-in
-    # profile it fires the genuine API request; without one the server
-    # answers 401/error and capture_chunks() pulls the builder out of the
-    # bundle so the exact schema can be asserted rather than guessed.
-    def generate(self, prompt, model="NARWHAL", aspect=None, count=1,
+    # ── generation (payload VERIFIED against the app's real request) ──
+    # Captured from the live composer (recon/auth/ogiz0b_real.json):
+    #   ogiZ0b -> /FlowService.BatchGenerateImages
+    #   payload = [null, [request...], 1, clientContext, [batchId]]
+    #   request = [null,null,null,seed,aspect,imageModelKey,null,clientContext,
+    #              [[[prompt]]],null,null,null,<uuid>,<uuid>]
+    #   recaptcha action = "IMAGE_GENERATION"
+    # NOTE: reCAPTCHA Enterprise flags headless Chrome ("PUBLIC_ERROR_UNUSUAL_
+    # ACTIVITY") — the app's own composer fails the same way in headless. A
+    # real (headed) browser or a fuller fingerprint is required to pass.
+    def _client_context(self, pid, token):
+        return [None, 22, None, None, None, pid, None, None, None, None,
+                [token, 1]] if token else [None, 22, None, None, None, pid]
+
+    def generate(self, prompt, model="BELUGA", aspect=None, count=1,
                  project_id=None, seed=None):
         pid = project_id or load_state().get("project_id", "")
         if not pid:
             _log("[!] generate: no project id")
             return None
         ar = ASPECT_WIRE.get(aspect, 3) if isinstance(aspect, str) else (aspect or 3)
-        token = self.mint("GENERATE")
-        if not token:
-            return None
         import uuid as _uuid
-        results, n = [], max(1, min(4, int(count or 1)))
+        raw = []
+        n = max(1, min(4, int(count or 1)))
         for i in range(n):
-            tok = token if i == 0 else self.mint("GENERATE")
-            req = [None, None, None, int(seed) if seed is not None else None,
-                   int(ar), norm_model(model), None,
-                   [None, 22, None, None, None, pid, None, None, None,
-                    [tok, 1]],
-                   [[[prompt]]], None, None, None,
-                   str(_uuid.uuid4()), str(_uuid.uuid4())]
-            payload = [None, [req], 1, None, None, None, None, None, None,
-                       None, None, None, None, None, None, None, None, None,
-                       None, None, None, None, None, None, None, None, 1]
-            data = self.call("ogiZ0b", payload, pid)
-            if data is None:
-                continue
-            for it in self._parse_ogi(data):
-                results.append(it)
-        return results or None
+            raw.append({"prompt": prompt, "seed": seed, "aspect": ar,
+                        "model": norm_model(model) or DEFAULT_MODEL})
+        # one token serves the whole batch (matches the app)
+        token = self.mint("IMAGE_GENERATION")
+        cc = self._client_context(pid, token)
+        reqs = []
+        for r in raw:
+            reqs.append([None, None, None,
+                         int(r["seed"]) if r["seed"] is not None else None,
+                         int(r["aspect"]), r["model"], None, cc,
+                         [[[r["prompt"]]]], None, None, None,
+                         str(_uuid.uuid4()).upper(), str(_uuid.uuid4()).upper()])
+        payload = [None, reqs, 1, cc, [str(_uuid.uuid4()).upper()]]
+        data = self.call("ogiZ0b", payload, pid)
+        if data is None:
+            return None
+        return self._parse_ogi(data) or None
 
     @staticmethod
     def _parse_ogi(data):
