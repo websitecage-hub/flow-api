@@ -259,6 +259,62 @@ try { const oq = navigator.permissions && navigator.permissions.query;
         ? Promise.resolve({state: Notification.permission}) : oq(p); } catch(e){}
 """
 
+# THE THING (2026-10-08): reCAPTCHA Enterprise reads the client-hint brand list,
+# not just UA/plugins/webdriver. Headless builds leak "HeadlessChrome" in
+# navigator.userAgentData.brands AND in the sec-ch-ua wire header. Mask BOTH:
+#  1) override navigator.userAgentData to a clean Chromium brand list, and
+#  2) scrub + replace sec-ch-ua* request headers (route handler below).
+# NEVER remove the user-agent header itself (a UA-less request is flagged).
+# Verified: with this fix chrome-headless-shell generates at ~96 MB RSS;
+# without it -> PUBLIC_ERROR_UNUSUAL_ACTIVITY in every headless mode.
+UAD_OVERRIDE_JS = """
+try {
+  const brands = [{brand:'Chromium', version:'153'}, {brand:'Not_A Brand', version:'8'}];
+  const full = [{brand:'Chromium', version:'153.0.8010.12'},
+                {brand:'Not_A Brand', version:'8.0.0.0'}];
+  const uad = {
+    brands, mobile: false, platform: 'Linux',
+    getHighEntropyValues: () => Promise.resolve({
+      brands: full, mobile: false, platform: 'Linux', architecture: 'x86',
+      bitness: '64', fullVersionList: full, platformVersion: '',
+      wow64: false, model: ''}),
+    toJSON: () => ({brands, mobile: false, platform: 'Linux'})
+  };
+  Object.defineProperty(navigator, 'userAgentData', {get: () => uad, configurable: true});
+} catch (e) {}
+"""
+# sec-ch-ua values a normal Chromium-153 desktop sends (do NOT vary these from
+# the UAD override above — mismatched brands are their own signal)
+CLEAN_CH_HEADERS = {
+    "sec-ch-ua": '"Chromium";v="153", "Not_A Brand";v="8"',
+    "sec-ch-ua-full-version-list":
+        '"Chromium";v="153.0.8010.12", "Not_A Brand";v="8.0.0.0"',
+    "sec-ch-ua-platform": '"Linux"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-arch": '"x86"',
+    "sec-ch-ua-bitness": '"64"',
+    "sec-ch-ua-model": '""',
+    "sec-ch-ua-platform-version": '""',
+    "sec-ch-ua-wow64": "?0",
+}
+
+
+def _scrub_ch_headers(route):
+    """Route handler: replace the sec-ch-ua* family with clean Chromium values.
+    User-Agent is left untouched. ONLY the client-hint headers are rewritten."""
+    try:
+        h = dict(route.request.headers)
+        for k in list(h):
+            if k.lower().startswith("sec-ch-ua"):
+                h.pop(k, None)
+        h.update(CLEAN_CH_HEADERS)
+        route.continue_(headers=h)
+    except Exception:
+        try:
+            route.continue_()
+        except Exception:
+            pass
+
 
 def parse_batchexecute(text: str):
     """-> list of (rpcid, decoded_payload). Mirrors the app's framing."""
@@ -331,6 +387,12 @@ class HeadlessEngine:
             self.ctx.add_init_script(STEALTH_JS)
         except Exception:
             pass
+        try:
+            # THE THING: mask the HeadlessChrome client-hint leak (wire + JS).
+            self.ctx.add_init_script(UAD_OVERRIDE_JS)
+            self.ctx.route("**/*", _scrub_ch_headers)
+        except Exception:
+            pass
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         _log(f"[*] headless-shell up ({Path(self.exe).name}), "
              f"RSS {rss_mb_of(str(PROFILE)):.0f} MB")
@@ -342,6 +404,14 @@ class HeadlessEngine:
         those cookies to the context. Phone-friendly: you can paste the
         cookie export straight into the Render env var."""
         raw = os.environ.get("FLOW_COOKIES_JSON", "").strip()
+        if not raw and COOKIES_FILE.exists():
+            # fall back to the on-disk export (import_cookies.py output) so a
+            # bare clone with sessions/ still boots signed-in
+            try:
+                raw = COOKIES_FILE.read_text(encoding="utf-8")
+                _log(f"[*] cookies from on-disk {COOKIES_FILE.name}")
+            except Exception:
+                pass
         if not raw:
             return
         import base64
@@ -403,6 +473,26 @@ class HeadlessEngine:
                 fn()
             except Exception:
                 pass
+
+    def restart(self):
+        """Kill and relaunch the whole browser. Self-heal for reCAPTCHA score
+        changes / wedged sessions: a fresh page gets a fresh reCAPTCHA iframe
+        and token state. Re-injects cookies (env or on-disk)."""
+        _log("[*] engine restart (self-heal)")
+        try:
+            self.ctx.close()
+        except Exception:
+            pass
+        try:
+            self.pw.stop()
+        except Exception:
+            pass
+        self.pw = None
+        self.ctx = None
+        self.page = None
+        self._at = ""
+        self.start()
+        return True
 
     # ── primitives ───────────────────────────────────────────────
     def mint(self, action: str = "GENERATE") -> str:
@@ -471,11 +561,18 @@ class HeadlessEngine:
                 [token, 1]] if token else [None, 22, None, None, None, pid]
 
     def generate(self, prompt, model="BELUGA", aspect=None, count=1,
-                 project_id=None, seed=None):
+                 project_id=None, seed=None, _escalate=True):
         """Generate via the UI composer. VERIFIED WORKING: the composer's own
-        ogiZ0b request passes reCAPTCHA (with the stealth fix) while a direct
-        in-page fetch() is flagged. So we drive the composer and capture the
-        response — same mechanism as a human, no result-fetching hacks."""
+        ogiZ0b request passes reCAPTCHA (with the stealth+client-hint fix) while
+        a direct in-page fetch() is flagged. So we drive the composer and
+        capture the response — same mechanism as a human, no result-fetching
+        hacks.
+
+        Self-heal: if the request is flagged (reCAPTCHA score changed) or the
+        engine wedges, restart the browser once and retry — a fresh page gets a
+        fresh reCAPTCHA iframe/token. This is what keeps generation from "going
+        black" when Google's bot scoring shifts (2026-10-08 incident).
+        """
         pid = project_id or load_state().get("project_id", "")
         if not pid:
             _log("[!] generate: no project id")
@@ -521,10 +618,30 @@ class HeadlessEngine:
                 pass
         if not caught:
             _log("[!] generate: no ogiZ0b response observed")
+            if _escalate:
+                _log("[*] generate: restarting engine and retrying once (self-heal)")
+                try:
+                    self.restart()
+                except Exception as e:
+                    _log(f"[!] restart failed: {str(e)[:120]}")
+                    return None
+                return self.generate(prompt, model=model, aspect=aspect,
+                                     count=count, project_id=project_id,
+                                     seed=seed, _escalate=False)
             return None
         body = caught[-1]
         if "UNUSUAL_ACTIVITY" in body:
             _log("[!] generate: reCAPTCHA flagged (stealth broken?)")
+            if _escalate:
+                _log("[*] generate: restarting engine and retrying once (fresh reCAPTCHA state)")
+                try:
+                    self.restart()
+                except Exception as e:
+                    _log(f"[!] restart failed: {str(e)[:120]}")
+                    return None
+                return self.generate(prompt, model=model, aspect=aspect,
+                                     count=count, project_id=project_id,
+                                     seed=seed, _escalate=False)
             return None
         parsed = parse_batchexecute(body)
         for rid, data in parsed:

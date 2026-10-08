@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow API — Live Test Bench</title>
+<style>
+  :root{
+    --bg:#0b0e13; --card:#131823; --card2:#0f141d; --line:#232c3d;
+    --txt:#e8eef7; --dim:#8ba0bd; --acc:#4f8cff; --ok:#34d399; --err:#f87171;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:15px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:24px 16px 80px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--dim);margin:0 0 18px;font-size:13px}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+  .chip{background:var(--card);border:1px solid var(--line);border-radius:8px;
+        padding:6px 12px;font-size:12.5px;color:var(--dim)}
+  .chip b{color:var(--txt);font-weight:600}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:18px;margin-bottom:16px}
+  label{display:block;font-size:12.5px;color:var(--dim);margin:12px 0 6px}
+  textarea,input,select{width:100%;background:var(--card2);border:1px solid var(--line);
+        border-radius:8px;color:var(--txt);padding:10px 12px;font-size:14px;font-family:inherit}
+  textarea{min-height:72px;resize:vertical}
+  select{appearance:auto}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row>div{flex:1;min-width:130px}
+  button{background:var(--acc);border:none;color:#fff;border-radius:8px;
+         padding:12px 18px;font-size:15px;font-weight:600;cursor:pointer;margin-top:16px}
+  button:hover{filter:brightness(1.1)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  #status{font-size:13.5px;margin-top:12px}
+  #status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--dim);
+        border-top-color:var(--acc);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-top:16px}
+  .img{position:relative;border-radius:10px;overflow:hidden;background:var(--card2);
+       border:1px solid var(--line)}
+  .img img{width:100%;display:block;border-radius:10px}
+  .img a{display:block;text-align:center;font-size:12px;padding:6px;color:var(--acc);
+         text-decoration:none;background:var(--card2)}
+  .img .meta{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.65);border-radius:6px;
+             padding:2px 8px;font-size:11px;color:#fff}
+  details{margin-top:14px}
+  summary{color:var(--dim);font-size:12.5px;cursor:pointer}
+  pre{background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:12px;
+      font-size:11px;overflow:auto;max-height:260px;color:#9fd3ff}
+  .err{color:var(--err)}
+  .ok{color:var(--ok)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Flow API — Live Test Bench</h1>
+  <p class="sub">Reverse-engineered Google Flow image generation, served as an HTTP API.
+     This page talks to the same engine your content automation will use.</p>
+
+  <div class="chips" id="chips">
+    <span class="chip">engine: <b id="c-engine">…</b></span>
+    <span class="chip">RSS: <b id="c-rss">…</b></span>
+    <span class="chip">credits: <b id="c-credits">…</b></span>
+    <span class="chip">project: <b id="c-project">…</b></span>
+    <span class="chip">session: <b id="c-session">…</b></span>
+  </div>
+
+  <div class="card">
+    <label>Prompt</label>
+    <textarea id="prompt" placeholder="a red fox sitting in a snowy forest, cinematic light">a red fox sitting in a snowy forest, cinematic light</textarea>
+    <div class="row">
+      <div><label>Model</label>
+        <select id="model">
+          <option value="BELUGA">BELUGA — Nano Banana 2.1 (default)</option>
+          <option value="NARWHAL">NARWHAL — Nano Banana 2</option>
+          <option value="HARBOR_SEAL">HARBOR_SEAL — Nano Banana 2 Lite</option>
+          <option value="GEM_PIX_2">GEM_PIX_2 — Nano Banana Pro</option>
+        </select></div>
+      <div><label>Aspect</label>
+        <select id="aspect">
+          <option value="1:1">1:1</option>
+          <option value="16:9" selected>16:9</option>
+          <option value="9:16">9:16</option>
+          <option value="3:4">3:4</option>
+          <option value="4:3">4:3</option>
+        </select></div>
+      <div><label>Count</label>
+        <select id="count">
+          <option>1</option><option>2</option><option>3</option><option>4</option>
+        </select></div>
+    </div>
+    <div class="row">
+      <div><label>API key (optional, if enabled on server)</label>
+        <input id="apikey" type="password" placeholder="Bearer token"></div>
+    </div>
+    <button id="go">Generate</button>
+    <div id="status"></div>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = {
+  async call(path, opts = {}) {
+    const headers = {};
+    const key = $("apikey").value.trim();
+    if (key) headers["Authorization"] = "Bearer " + key;
+    if (opts.body) headers["Content-Type"] = "application/json";
+    const r = await fetch(path, { ...opts, headers });
+    return r.json().catch(() => ({ ok: false, error: "bad json" }));
+  },
+};
+const setStatus = (html, cls = "") => {
+  $("status").innerHTML = `<div class="${cls}">${html}</div>`;
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function refreshStatus() {
+  try {
+    const h = await api.call("/health");
+    $("c-engine").textContent = h.engine || "?";
+    $("c-rss").textContent = (h.rss_mb ?? "?") + " MB";
+    $("c-project").textContent = (h.project || "none").slice(0, 13) + "…";
+    $("c-session").textContent = "n/a";
+    if (h.boot_error) $("c-session").textContent = "BOOT ERR";
+    const c = await api.call("/credits");
+    if (c.ok) $("c-credits").textContent = c.credits;
+    const s = await api.call("/session");
+    if (s.ok) $("c-session").textContent = s.session_ok ? "ok" : "DEAD";
+  } catch (e) { /* server not up yet */ }
+}
+
+async function generate() {
+  const btn = $("go");
+  btn.disabled = true;
+  const prompt = $("prompt").value.trim();
+  if (!prompt) { setStatus("prompt required", "err"); btn.disabled = false; return; }
+  $("results").innerHTML = "";
+  setStatus('<span class="spin"></span>submitting…');
+  const body = {
+    prompt,
+    model: $("model").value,
+    aspect: $("aspect").value,
+    count: parseInt($("count").value, 10),
+  };
+  const r = await api.call("/generate", { method: "POST", body: JSON.stringify(body) });
+  if (!r.ok) { setStatus("generate failed: " + esc(r.error || "unknown"), "err"); btn.disabled = false; return; }
+  setStatus('job <b>' + esc(r.job) + '</b> queued — engine may take 30–60s (RECAPTCHA gate)…');
+  const t0 = Date.now();
+  for (;;) {
+    await new Promise((res) => setTimeout(res, 2500));
+    const j = await api.call(r.poll);
+    const st = j.job ? j.job.status : "?";
+    const ms = Math.round((Date.now() - t0) / 1000);
+    setStatus('<span class="spin"></span>' + esc(st) + " — " + ms + "s elapsed");
+    if (st === "done") { renderResult(j.job.result); break; }
+    if (st === "failed" || st === "crashed") {
+      setStatus("job " + esc(st) + ": " + esc((j.job.error || "?").toString().slice(0, 300)), "err");
+      if (j.job.result) renderResult(j.job.result);
+      break;
+    }
+    if (ms > 240) { setStatus("timed out waiting (engine may be restarting — poll " + esc(r.poll) + ")", "err"); break; }
+  }
+  btn.disabled = false;
+}
+
+function renderResult(res) {
+  if (!res) return;
+  const media = res.media || (res.uuid ? [res] : []);
+  if (!media.length) { setStatus("no media in result", "err"); return; }
+  setStatus('<span class="ok">✓ ' + media.length + " image(s) generated" + (res.elapsed_s ? " in " + res.elapsed_s + "s" : "") + "</span>", "ok");
+  let html = '<div class="grid">';
+  for (const m of media) {
+    const url = m.url || "";
+    html += `<div class="img"><div class="meta">${esc(m.model || "")} ${esc(m.seed ?? "")}</div>` +
+            (url ? `<img src="${esc(url)}" alt="generated" loading="lazy" onerror="this.parentElement.innerHTML+='<i style=color:var(--err)>img failed</i>'">` : "") +
+            `<a href="${esc(url)}" target="_blank" rel="noopener">open full size ↗</a></div>`;
+  }
+  html += "</div>";
+  html += `<details><summary>raw job JSON</summary><pre>${esc(JSON.stringify(res, null, 2))}</pre></details>`;
+  $("results").innerHTML = html;
+}
+
+$("go").addEventListener("click", generate);
+refreshStatus();
+setInterval(refreshStatus, 20000);
+</script>
+</body>
+</html>

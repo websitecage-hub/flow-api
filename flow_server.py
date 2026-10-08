@@ -168,6 +168,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, api.restart())
             except Exception as e:
                 self._send(500, {"ok": False, "error": str(e)[:200]})
+        elif p.path in ("/ui", "/ui/", "/ui/index.html"):
+            # Live test bench — public (rate-limited, never auth-gated) so you
+            # can try generation from your phone anywhere. Serves the static
+            # page; all API calls it makes go through the same endpoints.
+            try:
+                ui = Path(__file__).parent / "ui" / "index.html"
+                if not ui.exists():
+                    self._send(404, {"ok": False, "error": "ui not found"})
+                    return
+                data = ui.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except Exception:
+                    pass
+            except Exception as e:
+                self._send(500, {"ok": False, "error": str(e)[:200]})
         elif p.path == "/session":
             try:
                 self._send(200, api.session_info())
@@ -310,6 +331,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 fp = Path(__file__).parent / "sessions" / "flow.cookies.full.json"
                 fp.parent.mkdir(exist_ok=True)
                 fp.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+                # also write next to the server (some paths look there)
+                try:
+                    Path(__file__).parent.joinpath("flow.cookies.full.json").write_text(
+                        json.dumps(clean, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
                 try:
                     api.http.reset()
                 except Exception:
@@ -382,6 +409,19 @@ ROLE = os.environ.get("ROLE", "").strip().lower()
 if ROLE not in ("all", "api"):
     _has_engine = bool(flow_api.CHROME) and flow_api.PROFILE.exists()
     ROLE = "all" if _has_engine else "api"
+# PRODUCTION SELF-HEAL (2026-10-08): if credentials are present (env cookies
+# or the shipped sessions/flow.cookies.full.json), force ROLE=all regardless of
+# a stale ROLE=api env var left over from the old split-brain deploy. A
+# self-contained image must boot its engine — this is what prevents "goes
+# black" on Render after a deploy with leftover env.
+try:
+    _cookies_present = bool(os.environ.get("FLOW_COOKIES_JSON", "").strip()) or (
+        Path(__file__).parent / "sessions" / "flow.cookies.full.json").exists()
+except Exception:
+    _cookies_present = False
+if ROLE == "api" and _cookies_present:
+    print("[*] cookies present -> forcing ROLE=all (self-contained generation)", flush=True)
+    ROLE = "all"
 
 
 class _Tee:
@@ -408,6 +448,28 @@ def _setup_log():
     logf = open(Path(__file__).parent / "srv.live.log", "a", encoding="utf-8")
     sys.stdout = _Tee(sys.stdout, logf)
     sys.stderr = _Tee(sys.stderr, logf)
+
+
+def _watchdog(interval=45):
+    """Watch the engine: if it died or boot failed, restart it. This is what
+    keeps the API from going black when the browser/reCAPTCHA wedges."""
+    import time as _t
+    while True:
+        _t.sleep(interval)
+        try:
+            alive = getattr(api, "engine", None) is not None
+            boot_err = getattr(api, "boot_error", "") or ""
+            if (not alive) or boot_err:
+                print(f"[watchdog] engine dead (alive={alive} boot_err={boot_err!r}) — restarting",
+                      flush=True)
+                try:
+                    api.restart()
+                    api.boot_error = ""
+                    print("[watchdog] engine restarted ok", flush=True)
+                except Exception as e:
+                    print(f"[watchdog] restart failed: {str(e)[:200]}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] error: {str(e)[:150]}", flush=True)
 
 
 def main():
@@ -439,12 +501,15 @@ def main():
                 else:
                     print(f"[!] engine unavailable: {r.get('error', '')}",
                           flush=True)
+                    api.boot_error = r.get("error", "")
             except Exception as e:  # noqa: BLE001
                 api.local_run = False
                 api.boot_error = str(e)[:300]
                 print(f"[!] boot failed: {api.boot_error}", flush=True)
 
         threading.Thread(target=_bg, daemon=True).start()
+        # watchdog: auto-restart a dead engine so generation never goes black
+        threading.Thread(target=_watchdog, daemon=True).start()
     else:
         api.local_run = False
         try:
