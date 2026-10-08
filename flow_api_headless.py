@@ -9,7 +9,9 @@ Exposes: FlowAPI, load_state, save_state, norm_model, CHROME, PROFILE
 """
 from __future__ import annotations
 
+import glob
 import os
+import queue
 import threading
 import time
 from pathlib import Path
@@ -19,7 +21,7 @@ from flow_headless import (HeadlessEngine, detect_headless_shell, load_state,
 import flow_store as _fs
 
 ASPECTS = {"16:9": 3, "4:3": 5, "1:1": 1, "3:4": 4, "9:16": 2}
-MODELS = ["NARWHAL", "HARBOR_SEAL", "GEM_PIX_2"]
+MODELS = ["NARWHAL", "HARBOR_SEAL", "GEM_PIX_2"]  # keep list stable; BELUGA valid via norm_model
 MODEL_DISPLAY = {
     "NANO BANANA 2": "NARWHAL", "NANO BANANA 2 LITE": "HARBOR_SEAL",
     "NANO BANANA PRO": "GEM_PIX_2", "NARWHAL": "NARWHAL",
@@ -66,19 +68,25 @@ class FlowAPI:
     def __init__(self):
         import queue
         self.engine = None
-        self.lock = threading.Lock()
         self._q = queue.Queue()
         self._ready = threading.Event()
+        self._counter_lock = threading.Lock()
         self._active = 0
         self.local_run = True
         self.boot_error = ""
         self._thread = None
         self.http = _NullHTTP()
+        self.last_engine_ok = 0.0        # epoch s of last successful engine op
+        self._rebuild_inflight = False   # single-flight guard for rebuilds
+        self._rebuild_lock = threading.Lock()
 
     # ── worker thread (Playwright sync API is thread-bound) ──────
-    def _worker(self):
+    def _worker(self, my_q):
         while True:
-            fn, ev, res = self._q.get()
+            item = my_q.get()
+            if item is None:            # poison pill: worker is being replaced
+                return
+            fn, ev, res = item
             try:
                 res["v"] = fn()
             except BaseException as e:  # noqa: BLE001
@@ -86,21 +94,66 @@ class FlowAPI:
             finally:
                 ev.set()
 
-    def run(self, fn, timeout=600):
+    def _start_worker(self):
+        self._q = queue.Queue()
+        self._thread = threading.Thread(target=self._worker,
+                                        args=(self._q,), daemon=True)
+        self._thread.start()
+
+    def _kill_browser_procs(self):
+        """SIGKILL every chrome-headless-shell tied to our profile dir.
+        Frees memory immediately and un-wedges any call stuck in Playwright.
+        Returns number killed."""
+        import signal
+        killed = 0
+        targets = []
+        for p in glob.glob("/proc/[0-9]*"):
+            try:
+                cmd = open(p + "/cmdline", "rb").read().replace(
+                    b"\0", b" ").decode("utf-8", "replace")
+                if (("chrome-headless-shell" in cmd or "headless_shell" in cmd)
+                        and str(PROFILE) in cmd):
+                    targets.append(int(p.split("/")[-1]))
+            except Exception:
+                pass
+        for pid in targets:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except Exception:
+                pass
+        if killed:
+            print(f"[*] SIGKILLed {killed} stray browser process(es)", flush=True)
+        return killed
+
+    def run(self, fn, timeout=600, _boot=False):
+        """Enqueue fn on the worker and wait up to `timeout`. NEVER holds a
+        lock while waiting — one slow call must not block every other call.
+        On timeout the worker is considered wedged: hard-rebuild the engine
+        (unless this call IS the boot) and raise."""
         if not self._ready.is_set():
             raise RuntimeError("engine not started")
-        with self.lock:
+        if self._thread is None or not self._thread.is_alive():
+            self._start_worker()
+        ev = threading.Event()
+        res = {}
+        self._q.put((fn, ev, res))
+        with self._counter_lock:
             self._active += 1
-            try:
-                ev = threading.Event()
-                res = {}
-                self._q.put((fn, ev, res))
-                if not ev.wait(timeout):
-                    raise TimeoutError("engine job timed out")
-                if "err" in res:
-                    raise res["err"]
-                return res.get("v")
-            finally:
+        try:
+            if not ev.wait(timeout):
+                if not _boot and not self._rebuild_inflight:
+                    try:
+                        self.hard_rebuild()
+                    except Exception as e:
+                        print(f"[!] auto rebuild failed: {str(e)[:120]}", flush=True)
+                raise TimeoutError(f"engine job timed out after {timeout}s")
+            if "err" in res:
+                raise res["err"]
+            self.last_engine_ok = time.time()
+            return res.get("v")
+        finally:
+            with self._counter_lock:
                 self._active -= 1
 
     def is_busy(self):
@@ -109,51 +162,92 @@ class FlowAPI:
         except Exception:
             return False
 
+    def hard_rebuild(self, boot=True):
+        """Supervisor recovery: kill the browser tree, drop the wedged worker,
+        boot a fresh engine on a fresh worker. Single-flight guarded."""
+        with self._rebuild_lock:
+            if self._rebuild_inflight:
+                return {"ok": False, "error": "rebuild already in progress"}
+            self._rebuild_inflight = True
+            try:
+                print("[*] hard rebuild: killing browser + resetting engine", flush=True)
+                self._kill_browser_procs()
+                self.engine = None
+                self._thread = None          # abandon wedged worker
+                self._q = queue.Queue()
+                self.boot_error = ""
+                if not boot:
+                    return {"ok": True}
+                return self._boot_engine()
+            finally:
+                self._rebuild_inflight = False
+
+    def _boot_engine(self):
+        def _boot():
+            eng = HeadlessEngine()
+            eng.start()
+            return eng
+        try:
+            eng = self.run(_boot, timeout=200, _boot=True)
+            self.engine = eng
+            try:
+                # warm the app + recaptcha
+                self.run(lambda: eng.goto_app("/"), timeout=90, _boot=True)
+            except Exception as e:
+                print(f"[*] warm goto: {str(e)[:120]}", flush=True)
+            self.last_engine_ok = time.time()
+            return {"ok": True, "engine": "chrome-headless-shell"}
+        except Exception as e:
+            self.boot_error = str(e)[:300]
+            print(f"[!] engine boot failed: {self.boot_error}", flush=True)
+            return {"ok": False, "error": self.boot_error}
+
     def start(self, boot_engine=True):
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+        self._start_worker()
         self._ready.set()
         if not boot_engine:
             return {"ok": True, "project": ""}
-
-        def _boot():
-            self.engine = HeadlessEngine()
-            self.engine.start()
-            return True
-
-        try:
-            self.run(_boot, timeout=180)
-        except Exception as e:  # noqa: BLE001
-            self.boot_error = str(e)[:300]
-            print(f"[!] headless engine boot failed: {self.boot_error}", flush=True)
-            return {"ok": False, "error": self.boot_error}
-        # open the app once so the page + recaptcha are warm
-        try:
-            self.run(lambda: self.engine.goto_app("/"), timeout=120)
-        except Exception as e:  # noqa: BLE001
-            print(f"[*] warm goto: {str(e)[:120]}", flush=True)
-        pid = load_state().get("project_id", "")
-        return {"ok": True, "project": pid}
+        return self._boot_engine()
 
     def close(self):
         try:
-            self.run(lambda: self.engine.close(), timeout=60)
+            self._kill_browser_procs()
         except Exception:
             pass
+        try:
+            if self._q:
+                self._q.put(None)
+        except Exception:
+            pass
+        self.engine = None
+
+    def restart(self):
+        """Public restart for /restart + watchdog. Synchronous, bounded."""
+        return self.hard_rebuild(boot=True)
 
     # ── fast, non-blocking status (Render health checks) ─────────
     def _base_info(self):
         st = load_state()
+        stale = (time.time() - self.last_engine_ok) > 180 if self.last_engine_ok else True
+        rss = 0.0
+        try:
+            rss = round(rss_mb_of(str(PROFILE)), 1)
+        except Exception:
+            pass
         return {
             "ok": True,
             "engine_alive": self.engine is not None,
+            "engine_responsive": not stale,
             "engine": "chrome-headless-shell",
-            "rss_mb": round(rss_mb_of(str(PROFILE)), 1),
+            "rss_mb": rss,
             "project": st.get("project_id", ""),
-            "model": st.get("model", "NARWHAL"),
+            "model": st.get("model", "BELUGA"),
             "busy": self.is_busy(), "local_run": self.local_run,
-            "cookies_ready": (ROOT / "sessions" / "flow.cookies.full.json").exists(),
+            "cookies_ready": (ROOT / "sessions" / "flow.cookies.full.json").exists()
+                             or bool(os.environ.get("FLOW_COOKIES_JSON", "").strip()),
             "boot_error": self.boot_error,
+            "last_engine_ok_age_s": round(time.time() - self.last_engine_ok, 1)
+                                    if self.last_engine_ok else -1,
         }
 
     def status(self):
@@ -165,7 +259,7 @@ class FlowAPI:
             sess = False
             try:
                 pid = out.get("project") or ""
-                if pid:
+                if pid and self.engine is not None:
                     d = self.engine.history(pid)
                     sess = d is not None
             except Exception:
@@ -180,16 +274,10 @@ class FlowAPI:
                     "after each deploy (PROFILE_TAR_URL).",
                 ]
             return out
-        return self.run(job, timeout=120)
-
-    def restart(self):
-        def job():
-            self.engine.close()
-            self.engine = HeadlessEngine()
-            self.engine.start()
-            self.engine.goto_app("/")
-            return {"ok": True}
-        return self.run(job, timeout=300)
+        try:
+            return self.run(job, timeout=90)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200], "session_ok": False}
 
     # ── jobs ─────────────────────────────────────────────────────
     def _submit_job(self, kind, params, fn, timeout=900):
@@ -277,14 +365,20 @@ class FlowAPI:
                             "stale": True}
                 return {"ok": False, "error": "history failed (login?)"}
             return {"ok": True, "project": pid, "media": media}
-        return self.run(job)
+        try:
+            return self.run(job, timeout=90)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
 
     def credits(self):
         def job():
             c = self.engine.credits()
             return ({"ok": True, **c} if c
                     else {"ok": False, "error": "credits failed (login?)"})
-        return self.run(job)
+        try:
+            return self.run(job, timeout=60)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
 
     def projects(self):
         return {"ok": True, "projects": []}

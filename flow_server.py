@@ -454,23 +454,27 @@ def _setup_log():
 
 
 def _watchdog(interval=45):
-    """Watch the engine: if it died or boot failed, restart it. This is what
-    keeps the API from going black when the browser/reCAPTCHA wedges."""
+    """Watch the engine: if it died, boot failed, OR went unresponsive (stale
+    heartbeat), hard-rebuild it. This is what keeps the API from going black
+    when the browser/reCAPTCHA wedges. Uses the facade's supervisor restart
+    (SIGKILL browser tree + fresh worker), never a lock-holding call."""
     import time as _t
     while True:
         _t.sleep(interval)
         try:
             alive = getattr(api, "engine", None) is not None
             boot_err = getattr(api, "boot_error", "") or ""
-            if (not alive) or boot_err:
-                print(f"[watchdog] engine dead (alive={alive} boot_err={boot_err!r}) — restarting",
+            last_ok = getattr(api, "last_engine_ok", 0.0) or 0.0
+            stale = (time.time() - last_ok) > 180 if last_ok else True
+            if (not alive) or boot_err or stale:
+                print(f"[watchdog] engine dead/alive={alive} boot_err={boot_err!r} stale={stale} — rebuilding",
                       flush=True)
                 try:
-                    api.restart()
+                    r = api.restart()
                     api.boot_error = ""
-                    print("[watchdog] engine restarted ok", flush=True)
+                    print(f"[watchdog] engine rebuilt: {r}", flush=True)
                 except Exception as e:
-                    print(f"[watchdog] restart failed: {str(e)[:200]}", flush=True)
+                    print(f"[watchdog] rebuild failed: {str(e)[:200]}", flush=True)
         except Exception as e:
             print(f"[watchdog] error: {str(e)[:150]}", flush=True)
 
