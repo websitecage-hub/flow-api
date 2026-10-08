@@ -1,29 +1,50 @@
 # Fully self-hosted Flow API on Render (no local PC, no local browser).
 #
-# The browser engine runs INSIDE this container, making the API self-contained.
+# The light browser engine (chrome-headless-shell, ~120 MB RSS) runs INSIDE
+# this container, making the API self-contained and FITTING free tier 512 MB.
 # Google Flow gates writes behind reCAPTCHA Enterprise, so a real browser is
 # required — there is no pure-requests generation path.
+#
+# PRODUCTION (2026-10-08): this file is the one Render actually builds
+# (dockerfilePath: ./Dockerfile.hosted). It MUST ship flow_headless.py +
+# flow_api_headless.py (the light engine) — without them flow_server.py's
+# engine selection ImportErrors at boot (deploys showed update_failed with no
+# reason) or falls back to the OLD full-Chrome engine (~1.2 GB) which
+# OOM-kills free tier ("exceeded its memory limit"). chrome-headless-shell is
+# the only binary that fits.
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ROLE=all \
+    FLOW_ENGINE=headless \
     FLOW_PROFILE=/data/profile \
-    FLOW_OUT=/data/outputs
+    FLOW_OUT=/data/outputs \
+    FLOW_MEM_GUARD_MB=420
 
 WORKDIR /app
 
-# Slim Python deps first (cached layer), then install Chromium + every
-# system library Playwright needs. Browser lands in /root/.cache/ms-playwright.
+# Slim Python deps first (cached layer), then install ONLY the light headless
+# browser: chrome-headless-shell (single process). NOT full Chromium (that is
+# the 1.2 GB RSS OOM source on free tier).
 COPY requirements.docker.txt .
 RUN pip install --no-cache-dir -r requirements.docker.txt \
-    && playwright install --with-deps chromium
+    && playwright install --with-deps chromium-headless-shell
 
-COPY flow_api.py flow_server.py flow_store.py worker.py gen.py menu.py flow.py ./
+# Everything: old engine (compat), light engine (the one used), server, store,
+# worker/CLI, cookie importer, start script.
+COPY flow_api.py flow_headless.py flow_api_headless.py flow_server.py \
+     flow_store.py worker.py gen.py menu.py flow.py ./
+COPY import_cookies.py ./
 COPY start.sh ./
 
-# /data is the Render Disk mount (profile + images survive redeploys).
-RUN chmod +x start.sh && mkdir -p /data/profile /data/outputs /data/sessions /data/logs
+# test bench UI (served at /ui)
+COPY ui/ ./ui/
+
+# /data is the Render Disk mount when attached; on free plan it's the
+# ephemeral filesystem (sessions seeded from FLOW_COOKIES_JSON env instead).
+RUN chmod +x start.sh && mkdir -p /data/profile /data/outputs /data/sessions \
+    /data/logs /app/sessions /app/logs /app/ui
 
 EXPOSE 8787
 CMD ["./start.sh"]
