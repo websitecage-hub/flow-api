@@ -414,19 +414,17 @@ ROLE = os.environ.get("ROLE", "").strip().lower()
 if ROLE not in ("all", "api"):
     _has_engine = bool(flow_api.CHROME) and flow_api.PROFILE.exists()
     ROLE = "all" if _has_engine else "api"
-# PRODUCTION SELF-HEAL (2026-10-08): if credentials are present (env cookies
-# or the shipped sessions/flow.cookies.full.json), force ROLE=all regardless of
-# a stale ROLE=api env var left over from the old split-brain deploy. A
-# self-contained image must boot its engine — this is what prevents "goes
-# black" on Render after a deploy with leftover env.
-try:
-    _cookies_present = bool(os.environ.get("FLOW_COOKIES_JSON", "").strip()) or (
-        Path(__file__).parent / "sessions" / "flow.cookies.full.json").exists()
-except Exception:
-    _cookies_present = False
-if ROLE == "api" and _cookies_present:
-    print("[*] cookies present -> forcing ROLE=all (self-contained generation)", flush=True)
-    ROLE = "all"
+# PRODUCTION SELF-HEAL (2026-10-08): a self-contained image (headless engine
+# selected AND browser present) MUST boot its own engine — a stale ROLE=api env
+# var left over from the old split-brain deploy must not disable generation.
+# Cookies only gate the SESSION (login), not the engine boot.
+if ROLE == "api":
+    _engine_available = bool(getattr(flow_api, "CHROME", "") or "")
+    if _engine_available:
+        print("[*] engine binary present -> forcing ROLE=all (self-contained)", flush=True)
+        ROLE = "all"
+    else:
+        print("[*] no engine binary -> staying ROLE=api (queue only)", flush=True)
 
 
 class _Tee:
