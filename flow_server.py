@@ -39,7 +39,12 @@ from flow_api import load_state, save_state
 # Engine selection: FLOW_ENGINE=headless runs the chrome-headless-shell engine
 # (single process, ~120 MB) which fits Render's free 512 MB tier. Default
 # keeps the original full-Chrome engine.
-if os.environ.get("FLOW_ENGINE", "").strip().lower() == "headless":
+# PRODUCTION (2026-10-08): default to headless when FLOW_ENGINE is unset. The
+# old full-Chrome engine boots at ~1.2 GB and OOM-kills free-tier instances on
+# every wake ("web service exceeded its memory limit") — the blackout cause.
+# Only an explicit FLOW_ENGINE=chrome/full opts into the heavy engine now.
+ENGINE_RAW = os.environ.get("FLOW_ENGINE", "").strip().lower()
+if ENGINE_RAW in ("", "headless", "light", "shell"):
     import flow_api_headless as flow_api  # noqa: F811
     from flow_api_headless import FlowAPI, load_state, save_state  # noqa: F401
 else:
