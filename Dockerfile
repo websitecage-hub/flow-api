@@ -41,8 +41,8 @@ RUN pip install --no-cache-dir -r requirements.docker.txt \
 
 # App code (engine + server + store + CLI). flow_api.py (full-Chrome) stays
 # for compat but is never the engine under FLOW_ENGINE=headless.
-COPY flow_api.py flow_headless.py flow_api_headless.py flow_server.py \
-     flow_store.py worker.py gen.py menu.py flow.py ./
+COPY flow_api.py flow_headless.py flow_api_headless.py flow_auth.py \
+     flow_server.py flow_store.py worker.py gen.py menu.py flow.py ./
 COPY import_cookies.py ./
 COPY start.sh ./
 COPY ui/ ./ui/
