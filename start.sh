@@ -38,4 +38,18 @@ if [ -n "${PROFILE_TAR_URL:-}" ] && [ ! -d "$FLOW_PROFILE/Default" ]; then
     || echo "[start] profile seed failed"
 fi
 
-exec python -u flow_server.py --host 0.0.0.0 --port "${PORT:-8787}"
+# SIGTERM handler: Render sends SIGTERM to PID 1 during deploys. The browser
+# subprocess can outlive python and stall the container swap -> update_failed.
+# Trap it: kill chrome, then exit immediately so the new container takes over.
+cleanup() {
+  pkill -9 -f chrome-headless-shell 2>/dev/null
+  pkill -9 -f "flow_server.py" 2>/dev/null
+  exit 0
+}
+trap cleanup SIGTERM SIGINT
+
+python -u flow_server.py --host 0.0.0.0 --port "${PORT:-8787}" &
+SERVER_PID=$!
+# forward SIGTERM to the python process (which re-traps and exits fast)
+wait $SERVER_PID
+
