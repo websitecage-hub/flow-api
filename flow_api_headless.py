@@ -380,8 +380,6 @@ class FlowAPI:
             pass
         r = self._boot_engine()
         self._start_supervisor()
-        # verify login in the background; self-heals (re-seeds) if stale
-        threading.Thread(target=self.ensure_session, daemon=True).start()
         return r
 
     def close(self):
@@ -429,15 +427,20 @@ class FlowAPI:
         verify the login (re-seeding cookies if it lapsed). Also drives the
         pure-Python auth layer: PSIDTS rotation (10 min) + at refresh (30 min).
         Never rebuilds while a job is running."""
-        last_sess = time.time()
+        boot_ts = time.time()
+        last_sess = time.time() + 120   # first session check ~2min after boot
         while True:
             time.sleep(self._supervisor_interval)
             try:
                 # ── pure-Python auth upkeep (no browser needed) ──
                 if AUTH.jar:
                     AUTH.rotate()                    # ≥600s cadence internally
-                    AUTH.ensure_at(max_age=1800)     # 30 min
+                    if (time.time() - boot_ts) > 120:
+                        AUTH.ensure_at(max_age=1800)  # 30 min; skip boot race
                 if self.is_busy():
+                    continue
+                # give the boot engine time to settle before any rebuild
+                if time.time() - boot_ts < 150:
                     continue
                 if self.engine is None or self.boot_error:
                     print("[supervisor] engine missing -> rebuild", flush=True)
