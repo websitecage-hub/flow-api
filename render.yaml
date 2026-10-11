@@ -1,20 +1,19 @@
-# Flow API — SELF-CONTAINED on Render FREE tier (512 MB RAM).
+# Flow API — self-contained on Render FREE tier (512 MB RAM).
 #
-# Runs flow_server.py with the chrome-headless-shell engine inline.
-# Measured: 115 MB with flow.google.com loaded, 118 MB peak while minting
-# a reCAPTCHA Enterprise token. No home PC worker required.
+# One service, one Dockerfile (./Dockerfile): it installs ONLY
+# chromium-headless-shell (~128 MB RSS) and runs flow_server.py with the light
+# engine inline. render.yaml is the single source of truth for the deploy.
 #
-# The heavy "--headless=new" Chrome used by the old Dockerfile.hosted needs
-# ~1.2 GB and is why the repo previously concluded "free tier OOMs".
-#
-# NOTE: Render free instances have NO persistent disk, so a logged-in Flow
-# profile cannot be stored across deploys. Seed it with PROFILE_TAR_URL
-# (a tarball of a logged-in profile) — see DEPLOY-FREE.md.
+# Free instances have NO persistent disk, so the signed-in Flow session is
+# seeded on boot from FLOW_COOKIES_JSON (base64 cookie export, phone-friendly)
+# or PROFILE_TAR_URL (a logged-in profile tarball). Free instances sleep after
+# 15 min idle — keep them warm with an UptimeRobot HTTP monitor on /health
+# (750 free instance-hours/month ≈ one always-on service).
 services:
   - type: web
     name: flow-api
     runtime: docker
-    dockerfilePath: ./Dockerfile.headless
+    dockerfilePath: ./Dockerfile
     plan: free                    # 512 MB — the headless engine fits
     region: oregon
     healthCheckPath: /health
@@ -25,7 +24,7 @@ services:
       - key: FLOW_ENGINE
         value: headless
       - key: FLOW_PROFILE
-        value: /app/profile-copy  # free tier: no /data disk; seeded from tarball
+        value: /app/profile-copy  # free tier: no disk; seeded each boot
       - key: FLOW_OUT
         value: /app/outputs
       - key: FLOW_MEM_GUARD_MB
@@ -33,13 +32,31 @@ services:
       - key: FLOW_PROJECT
         sync: false               # your Flow project uuid
       - key: FLOW_MODEL
-        value: NARWHAL
+        value: BELUGA             # Nano Banana 2.1
       - key: API_KEYS
-        sync: false               # cms1:secret1  (content systems send this)
-      - key: PROFILE_TAR_URL
-        sync: false               # tarball of a logged-in browser profile
+        sync: false               # cms1:<long-random-secret>
       - key: FLOW_COOKIES_JSON
-        sync: false               # OR: base64 cookie export (phone-friendly)
+        sync: false               # base64 cookie export (phone-friendly)
+      - key: FLOW_MASTER_TOKEN
+        sync: false               # aas_et/... master token (mints the full jar)
+      - key: FLOW_ACCOUNT_EMAIL
+        sync: false               # account for the master token
+      - key: FLOW_ANDROID_ID
+        value: "0123456789abcdef"
+      - key: FLOW_KV_URL
+        sync: false               # Cloudflare Worker KV endpoint (jar persistence)
+      - key: FLOW_KV_SECRET
+        sync: false               # auth header for the KV endpoint
+      - key: FLOW_EMAIL
+        sync: false               # optional: auto sign-in when cookies die
+      - key: FLOW_PASSWORD
+        sync: false               # (throwaway account only; no 2FA)
+      - key: PROFILE_TAR_URL
+        sync: false               # OR a logged-in profile tarball URL
+      - key: FLOW_PROXY_URL
+        sync: false               # optional: residential proxy for the browser
+      - key: FLOW_JS_HEAP_MB
+        value: "224"              # V8 old-space cap (avoid renderer OOM crash)
       - key: RATE_POST_PER_MIN
         value: "20"
       - key: RATE_GET_PER_MIN

@@ -112,7 +112,7 @@ python flow_headless.py --capture-ui     # dump live UI options/models
 
 ## 6. Deploy (Render free)
 
-Blueprint `render.yaml` -> `Dockerfile.headless`, `plan: free`,
+Blueprint `render.yaml` -> `Dockerfile` (single), `plan: free`,
 `FLOW_ENGINE=headless`. Set `FLOW_PROJECT` + `API_KEYS` + `FLOW_COOKIES_JSON`.
 Free tier has **no persistent disk** -> seed the login via `FLOW_COOKIES_JSON`
 (phone-friendly) or `PROFILE_TAR_URL`. Free instances **sleep after 15 min idle**
@@ -142,8 +142,9 @@ Free tier has **no persistent disk** -> seed the login via `FLOW_COOKIES_JSON`
 
 **New:** `flow_headless.py` (engine, stealth, composer-generate, capture),
 `flow_api_headless.py` (facade), `import_cookies.py`, `bootstrap.sh`,
-`push_cookies.sh`, `Dockerfile.headless`, `render.yaml` (free), `start.sh`
-(picks light binary), `DEPLOY-FREE.md`, `VERDICT.md`, `CONTEXT.md`.
+`push_cookies.sh`, `Dockerfile` (single canonical deploy file), `render.yaml`
+(free), `start.sh` (picks light binary), `DEPLOY-FREE.md`, `VERDICT.md`,
+`CONTEXT.md`.
 **Recon:** `recon_fp.py` (fingerprint diff), `recon_fix.py` (stealth proof),
 `recon_batchexecute.py`, `recon_recaptcha.py`, `recon_capture.py`.
 **Old (full-Chrome engine):** `flow_api.py`, `flow_server.py` (engine via

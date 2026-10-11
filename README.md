@@ -112,12 +112,14 @@ tokens fine. So the API — engine included — runs on free Render:
 
 ```
 FLOW_ENGINE=headless  # flow_server.py -> flow_api_headless.FlowAPI
-Dockerfile.headless   # installs chromium-headless-shell only
-render.yaml           # plan: free
+Dockerfile            # installs chromium-headless-shell only (the ONE Dockerfile)
+render.yaml           # plan: free, dockerfilePath: ./Dockerfile
 ```
 
-See **`DEPLOY-FREE.md`**. The only free-tier caveat: no persistent disk, so
-the logged-in profile is seeded on boot from `PROFILE_TAR_URL`.
+See **`DEPLOY-FREE.md`**. Free-tier caveat: no persistent disk, so the
+logged-in session is seeded on boot from `FLOW_COOKIES_JSON` or
+`PROFILE_TAR_URL`. Verify a deploy with `GET /diag` (names the failing stage)
+and `GET /health` (`last_error`, `rss_mb`, `proxy`).
 
 The old split-brain is still available if you want it (see `DEPLOY.md`):
 `ROLE=api` on Render + `python worker.py --api <url> --key <secret>` at home.

@@ -57,11 +57,48 @@ ROOT = Path(__file__).parent
 SITE_KEY = os.environ.get("FLOW_SITE_KEY",
                           "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV")
 FLOW = "https://flow.google.com"
-BE_PATH = "/u/1/_/AiSandboxAngularFrontend/data/batchexecute"
+BE_PATH = "/_/AiSandboxAngularFrontend/data/batchexecute"
 PROFILE = Path(os.environ.get("FLOW_PROFILE", str(ROOT / "profile-copy")))
+# AUTH-CRITICAL (see flow_auth.py): the browser profile must run UNBOUND
+# (sessions stay rotation-capable from datacenter IPs). Flag is appended in
+# HeadlessEngine.start(); kept here so other launchers can reuse it.
+UNBOUND_FEATURES = "--disable-features=EnableBoundSessionCredentials,DeviceBoundSessions"
 STATE_FILE = ROOT / "sessions" / "flow_api_state.json"
 COOKIES_FILE = ROOT / "sessions" / "flow.cookies.full.json"
 MEM_GUARD_MB = int(os.environ.get("FLOW_MEM_GUARD_MB", "420"))
+
+# V8 old-space cap for the renderer. Too low -> the Flow Angular app's JS heap
+# overflows and the renderer crashes (no ogiZ0b response -> generation "goes
+# black"); too high -> risks the 512 MB container OOM-kill. 224 MB is measured
+# safe with the light engine (~130 MB process RSS) on a 512 MB box.
+JS_HEAP_MB = int(os.environ.get("FLOW_JS_HEAP_MB", "224"))
+
+# How long to wait for the Flow composer to hydrate before generating.
+# Render free's 0.1 CPU can take much longer than a local box on a cold page.
+# First load right after login is the slowest case (~2 min observed).
+COMPOSER_TIMEOUT = int(os.environ.get("FLOW_COMPOSER_TIMEOUT", "120"))
+
+
+def _proxy_config():
+    """Optional egress proxy for the browser, from FLOW_PROXY_URL.
+
+    reCAPTCHA Enterprise scores the *client IP*: a datacenter IP (Render/AWS)
+    can be flagged even with a perfect fingerprint, while a residential IP
+    passes. Set FLOW_PROXY_URL=http://user:pass@host:port to route all browser
+    traffic through a residential proxy. Returns None when unset."""
+    raw = os.environ.get("FLOW_PROXY_URL", "").strip()
+    if not raw:
+        return None
+    from urllib.parse import urlparse
+    u = urlparse(raw if "://" in raw else "http://" + raw)
+    if not u.hostname:
+        return None
+    cfg = {"server": f"{u.scheme}://{u.hostname}" + (f":{u.port}" if u.port else "")}
+    if u.username:
+        cfg["username"] = u.username
+    if u.password:
+        cfg["password"] = u.password
+    return cfg
 
 # ── model registry (VERIFIED against the live app 2026-10-07) ─────
 # Wire codes come from the app's own enum (FlowModel enum in the auth-gated
@@ -192,6 +229,14 @@ def load_state() -> dict:
     return st
 
 
+def save_state(st: dict):
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # ────────────────────────────────────────────────────────────────
 # in-page JS: mint + batchexecute (the genuine API calls)
 # ────────────────────────────────────────────────────────────────
@@ -210,18 +255,28 @@ JS_MINT = """(site) => new Promise((resolve) => {
   setTimeout(() => fin({ok: false, err: 'mint_timeout'}), 45000);
 })"""
 
-JS_RPC = """async ({rpcid, payload, at, pid}) => {
+JS_RPC = """async ({rpcid, payload, at, pid, base}) => {
   const fReq = JSON.stringify([[[rpcid, JSON.stringify(payload), null, "generic"]]]);
   const body = new URLSearchParams();
   body.set('f.req', fReq);
   if (at) body.set('at', at);
-  const src = pid ? ('/u/1/project/' + pid) : '/u/1/';
-  const u = location.origin + '/u/1/_/AiSandboxAngularFrontend/data/batchexecute' +
-            '?rpcids=' + rpcid + '&source-path=' + encodeURIComponent(src);
+  const src = pid ? ('/project/' + pid) : '/';
+  // Reuse the app's OWN batchexecute URL captured from live traffic so the
+  // path + build-label params stay correct as Google changes them. Current
+  // real shape (verified 2026-10-10): NO /u/1/ prefix, path is /_/..., plus
+  // bl=, f.sid=, hl=, rt=c. Fall back to that known shape.
+  let u = (base && base.length)
+    ? base
+    : location.origin + '/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=' +
+      rpcid + '&source-path=' + encodeURIComponent(src) + '&hl=en-GB&rt=c';
   try {
-    const r = await fetch(u, {
+    const url = new URL(u, location.origin);
+    url.searchParams.set('rpcids', rpcid);
+    url.searchParams.set('source-path', src);
+    const r = await fetch(url.toString(), {
       method: 'POST', credentials: 'include',
-      headers: {'content-type': 'application/x-www-form-urlencoded;charset=UTF-8'},
+      headers: {'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                'x-same-domain': '1'},
       body: body.toString()
     });
     const text = await r.text();
@@ -346,6 +401,10 @@ class HeadlessEngine:
         self.ctx = None
         self.page = None
         self._at = ""
+        self._be_base = ""            # app's own batchexecute URL (captured, reused)
+        self._live_at = ""            # app's own at token (captured from its body)
+        self._force_reseed = False    # set by restart(reseed=True)
+        self.last_error = ""          # last engine-side failure (surfaced by /health)
 
     # ── lifecycle ────────────────────────────────────────────────
     def start(self, force_heavy_chrome: bool = False):
@@ -368,6 +427,7 @@ class HeadlessEngine:
             user_agent=SPOOF_UA,           # reCAPTCHA: no "HeadlessChrome" brand
             ignore_default_args=["--enable-automation"],
             viewport={"width": 1280, "height": 900},
+            proxy=_proxy_config(),         # optional residential egress
             args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
@@ -381,7 +441,11 @@ class HeadlessEngine:
                 "--no-first-run", "--no-default-browser-check",
                 # memory trims that matter at 512 MB
                 "--disable-extensions", "--disable-sync",
-                "--js-flags=--max-old-space-size=128",
+                # AUTH-CRITICAL: launch UNBOUND so the session's PSIDTS pair
+                # accepts server-side rotation (flow_auth.rotate_psidts).
+                # Bound sessions 401 RotateCookies from datacenter IPs.
+                UNBOUND_FEATURES,
+                f"--js-flags=--max-old-space-size={JS_HEAP_MB}",
             ])
         try:
             self.ctx.add_init_script(STEALTH_JS)
@@ -394,6 +458,24 @@ class HeadlessEngine:
         except Exception:
             pass
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+
+        # Capture the app's own batchexecute URL + `at` token from its traffic
+        # so our RPCs copy them verbatim (path, build-label, xsrf) instead of
+        # guessing — Google changes these and stale guesses return 400.
+        def _grab(r):
+            try:
+                if "batchexecute" in r.url and not self._be_base:
+                    self._be_base = r.url
+                    m = re.search(r"(?:^|&)at=([^&]+)", r.post_data or "")
+                    if m:
+                        self._live_at = urllib.parse.unquote(m.group(1))
+            except Exception:
+                pass
+
+        try:
+            self.page.on("request", _grab)
+        except Exception:
+            pass
         _log(f"[*] headless-shell up ({Path(self.exe).name}), "
              f"RSS {rss_mb_of(str(PROFILE)):.0f} MB")
         self._inject_cookies()
@@ -402,7 +484,25 @@ class HeadlessEngine:
     def _inject_cookies(self):
         """If FLOW_COOKIES_JSON (a JSON array, or base64 of it) is set, add
         those cookies to the context. Phone-friendly: you can paste the
-        cookie export straight into the Render env var."""
+        cookie export straight into the Render env var.
+
+        IMPORTANT: only seed ONCE per profile. Google rotates
+        `__Secure-1PSIDTS` every few minutes; re-injecting the static export on
+        every boot overwrites the browser's *fresh* rotated token with a stale
+        one, which makes Google treat the session as invalid (the app then
+        redirects to /about). The profile keeps the rotated cookies, so after
+        the first seed we leave it alone. Set FLOW_FORCE_COOKIES=1 to override.
+        """
+        seed_marker = PROFILE / ".cookies_seeded"
+        if (seed_marker.exists() and not os.environ.get("FLOW_FORCE_COOKIES")
+                and not getattr(self, "_force_reseed", False)):
+            _log("[*] profile already seeded; keeping rotated session cookies")
+            try:
+                self.page.reload(timeout=45000, wait_until="commit")
+                self._pump(seconds=4)
+            except Exception:
+                pass
+            return
         raw = os.environ.get("FLOW_COOKIES_JSON", "").strip()
         if not raw and COOKIES_FILE.exists():
             # fall back to the on-disk export (import_cookies.py output) so a
@@ -449,6 +549,10 @@ class HeadlessEngine:
             self._pump(seconds=6)
         except Exception:
             pass
+        try:
+            seed_marker.write_text(str(time.time()), encoding="utf-8")
+        except Exception:
+            pass
 
     def goto_app(self, path: str = "/"):
         url = FLOW + path
@@ -474,11 +578,12 @@ class HeadlessEngine:
             except Exception:
                 pass
 
-    def restart(self):
+    def restart(self, reseed=False):
         """Kill and relaunch the whole browser. Self-heal for reCAPTCHA score
         changes / wedged sessions: a fresh page gets a fresh reCAPTCHA iframe
-        and token state. Re-injects cookies (env or on-disk)."""
-        _log("[*] engine restart (self-heal)")
+        and token state. With reseed=True, also re-inject FLOW_COOKIES_JSON /
+        the on-disk export (use when logged out)."""
+        _log(f"[*] engine restart (self-heal{' + reseed' if reseed else ''})")
         try:
             self.ctx.close()
         except Exception:
@@ -491,8 +596,150 @@ class HeadlessEngine:
         self.ctx = None
         self.page = None
         self._at = ""
-        self.start()
+        self._be_base = ""
+        self._live_at = ""
+        self._force_reseed = bool(reseed)
+        try:
+            self.start()
+        finally:
+            self._force_reseed = False
         return True
+
+    # ── session guard (self-healing auth) ────────────────────────
+    def session_ok(self) -> bool:
+        """True iff the account is logged in, proven by an authenticated read
+        (nzlxg credits). Loads the app first so cookies/`at` are live."""
+        try:
+            if "flow.google.com" not in (self.page.url or ""):
+                self.goto_app("/")
+                self._pump(seconds=6)
+        except Exception:
+            return False
+        try:
+            return self.call("nzlxg", []) is not None
+        except Exception:
+            return False
+
+    def ensure_session(self, reseed=True):
+        """Guarantee a logged-in session. Order: re-seed from
+        FLOW_COOKIES_JSON / on-disk export; if still logged out and
+        FLOW_EMAIL + FLOW_PASSWORD are set, perform a full interactive-style
+        sign-in (the account's own flow, no 2FA). Returns bool."""
+        if self.session_ok():
+            return True
+        self.last_error = "logged out"
+        if reseed:
+            _log("[*] session lost -> re-seeding cookies and rebuilding")
+            try:
+                self.restart(reseed=True)
+            except Exception as e:
+                self.last_error = f"reseed restart failed: {str(e)[:120]}"
+                return False
+            if self.session_ok():
+                self.last_error = ""
+                return True
+        # cookies stale/absent -> try a real sign-in
+        email = os.environ.get("FLOW_EMAIL", "").strip()
+        pwd = os.environ.get("FLOW_PASSWORD", "").strip()
+        if not (email and pwd):
+            self.last_error = ("logged out; no FLOW_EMAIL/FLOW_PASSWORD for "
+                               "auto-login and cookies are stale")
+            return False
+        _log("[*] cookies dead -> attempting full sign-in with FLOW_EMAIL")
+        try:
+            ok = self.login(email, pwd)
+        except Exception as e:
+            self.last_error = f"login() crashed: {str(e)[:150]}"
+            return False
+        self.last_error = "" if ok else "sign-in failed (wrong creds / bot check / 2FA?)"
+        return ok
+
+    def login(self, email: str, password: str) -> bool:
+        """Full Google sign-in by driving the real accounts.google.com UI
+        (identifier -> password -> continue). Verified flow (HAR 2026-10-11):
+        UEkKwb init -> MI613e email -> B4hajb password -> Flow session works.
+        No 2FA on the account => password-only challenge. NOT a raw RPC replay:
+        identity endpoints are fingerprinted, so we use the real page."""
+        import time as _t
+        URL = ("https://accounts.google.com/v3/signin/identifier?"
+               "continue=https%3A%2F%2Fflow.google.com%2F"
+               "&flowName=GlifWebSignIn&flowEntry=ServiceLogin")
+        try:
+            self.page.goto(URL, wait_until="commit", timeout=60000)
+        except Exception as e:
+            self.last_error = f"goto signin failed: {str(e)[:120]}"
+            return False
+        self._pump(seconds=6)
+        try:
+            box = self.page.locator("#identifierId")
+            box.wait_for(state="visible", timeout=30000)
+            box.click()
+            self.page.keyboard.type(email, delay=25)
+            _t.sleep(1)
+            # "Next" button (or Enter)
+            try:
+                self.page.locator("#identifierNext button").first.click(timeout=8000)
+            except Exception:
+                self.page.keyboard.press("Enter")
+            self._pump(seconds=6)
+            pw = self.page.locator("input[type=password]:visible")
+            pw.wait_for(state="visible", timeout=30000)
+            pw.click()
+            self.page.keyboard.type(password, delay=25)
+            _t.sleep(1)
+            try:
+                self.page.locator("#passwordNext button").first.click(timeout=8000)
+            except Exception:
+                self.page.keyboard.press("Enter")
+            # wait for either Flow (success) or an error surface
+            deadline = _t.time() + 60
+            while _t.time() < deadline:
+                self._pump(seconds=3)
+                try:
+                    u = self.page.url or ""
+                except Exception:
+                    continue
+                if "flow.google.com" in u and "/about" not in u:
+                    break
+                # dismiss passkey nudge / wizard cards if present
+                for label in ("Not now", "Skip", "Cancel"):
+                    try:
+                        btn = self.page.get_by_role("button", name=label)
+                        if btn.count() and btn.first.is_visible():
+                            btn.first.click(timeout=2000)
+                    except Exception:
+                        pass
+            ok = self.session_ok()
+            if not ok:
+                # capture what Google actually showed (wrong pwd? bot check? 2FA?)
+                try:
+                    dbg = ROOT / "sessions" / "login-debug"
+                    dbg.mkdir(parents=True, exist_ok=True)
+                    self.page.screenshot(path=str(dbg / "login_fail.png"),
+                                         full_page=True)
+                    (dbg / "login_fail.html").write_text(self.page.content(),
+                                                         encoding="utf-8")
+                    (dbg / "login_fail.url.txt").write_text(
+                        str(self.page.url), encoding="utf-8")
+                    _log(f"[*] login debug saved -> {dbg}")
+                except Exception:
+                    pass
+            if ok:
+                # persist the fresh (rotating) cookies so future restarts seed
+                # from a LIVE session instead of the stale export
+                try:
+                    import json as _json
+                    jar = self.ctx.cookies()
+                    COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    COOKIES_FILE.write_text(_json.dumps(jar), encoding="utf-8")
+                    _log(f"[*] login: dumped {len(jar)} cookies -> {COOKIES_FILE.name}")
+                except Exception:
+                    pass
+            _log(f"[*] login() -> {'OK' if ok else 'FAILED'} (final url: {self.page.url})")
+            return ok
+        except Exception as e:
+            self.last_error = f"login flow error: {str(e)[:150]}"
+            return False
 
     # ── primitives ───────────────────────────────────────────────
     def mint(self, action: str = "GENERATE") -> str:
@@ -500,7 +747,8 @@ class HeadlessEngine:
         r = self.page.evaluate(JS_MINT.replace("'GENERATE'", json.dumps(action)),
                                SITE_KEY)
         if not (r or {}).get("ok"):
-            _log(f"[!] mint failed: {(r or {}).get('err')}")
+            self.last_error = f"mint failed: {(r or {}).get('err')}"
+            _log(f"[!] {self.last_error}")
             return ""
         return r.get("token", "")
 
@@ -514,11 +762,13 @@ class HeadlessEngine:
         return self._at
 
     def call(self, rpcid: str, payload, project_id: str = ""):
-        """POST a batchexecute RPC from inside the page. Returns parsed data."""
+        """POST a batchexecute RPC from inside the page. Returns parsed data.
+        Uses the app's captured URL/at when available (copy-the-headers)."""
         pid = project_id or load_state().get("project_id", "")
-        self.at_token()
+        at = self._live_at or self.at_token()
         r = self.page.evaluate(JS_RPC, {
-            "rpcid": rpcid, "payload": payload, "at": self._at, "pid": pid,
+            "rpcid": rpcid, "payload": payload, "at": at, "pid": pid,
+            "base": self._be_base,
         })
         if not isinstance(r, dict) or r.get("status") != 200:
             _log(f"[!] rpc {rpcid}: {r}")
@@ -545,6 +795,40 @@ class HeadlessEngine:
             return None
         data = self.call("Zzl0ze", [f"projects/{pid}", None, None, None, [1]], pid)
         return data
+
+    def create_project(self):
+        """Create a new Flow project and return its uuid ('' on failure).
+        App's real payload (HAR 2026-10-11):
+          ["projects/*", [null, ["<name>"]], [null, 22]]  -> ["<uuid>", [<name>]]
+        A bare [] also works (verified live) — we send the named shape and
+        fall back to [] if it fails."""
+        name = time.strftime("%b %d - %H:%M")
+        data = self.call("jHPbke", ["projects/*", [None, [name]], [None, 22]])
+        if not (isinstance(data, list) and data and isinstance(data[0], str)):
+            data = self.call("jHPbke", [])   # fallback: bare shape, verified
+        if isinstance(data, list) and data and isinstance(data[0], str):
+            return data[0]
+        self.last_error = f"create_project failed: {str(data)[:120]}"
+        return ""
+
+    def projects(self, limit: int = 30):
+        """List projects (rpcid `UpteDb`, payload `["projects/*",21,...,[1]]`).
+        VERIFIED 2026-10-10: response is `[[[uuid,[name,null,[ts],thumb,media]]]]`."""
+        data = self.call("UpteDb", ["projects/*", 21, None, None, None, None, [1]])
+        out = []
+        try:
+            for rec in (data or []):
+                if isinstance(rec, list) and rec and isinstance(rec[0], str):
+                    meta = rec[1] if len(rec) > 1 and isinstance(rec[1], list) else []
+                    out.append({"project": rec[0],
+                                "name": meta[0] if meta else "",
+                                "thumb": meta[3] if len(meta) > 3 else "",
+                                "media": meta[4] if len(meta) > 4 else ""})
+                    if len(out) >= limit:
+                        break
+        except Exception:
+            pass
+        return out
 
     # ── generation (payload VERIFIED against the app's real request) ──
     # Captured from the live composer (recon/auth/ogiz0b_real.json):
@@ -573,12 +857,67 @@ class HeadlessEngine:
         fresh reCAPTCHA iframe/token. This is what keeps generation from "going
         black" when Google's bot scoring shifts (2026-10-08 incident).
         """
+        if not self.session_ok():
+            _log("[*] generate: not logged in -> ensure_session()")
+            self.ensure_session()
         pid = project_id or load_state().get("project_id", "")
+        if not pid:
+            # auto-create a project so generation "just works" with no id set
+            _log("[*] generate: no project id -> creating a new project")
+            pid = self.create_project()
+            if pid:
+                try:
+                    st = load_state()
+                    st["project_id"] = pid
+                    save_state(st)
+                except Exception:
+                    pass
         if not pid:
             _log("[!] generate: no project id")
             return None
-        self.goto_app(f"/u/1/project/{pid}")
-        self._pump(seconds=6)
+        self.goto_app(f"/project/{pid}")
+        # 404? the stored project id is stale/deleted -> auto-create a fresh one
+        try:
+            self._pump(seconds=3)
+            if "404" in (self.page.url or ""):
+                _log(f"[*] generate: project {pid} is 404 -> creating a new one")
+                pid = self.create_project()
+                if not pid:
+                    self.last_error = "project 404 and auto-create failed"
+                    return None
+                try:
+                    st = load_state()
+                    st["project_id"] = pid
+                    save_state(st)
+                except Exception:
+                    pass
+                self.goto_app(f"/project/{pid}")
+        except Exception:
+            pass
+        # Poll for the composer instead of a fixed sleep: Angular hydration is
+        # slow on Render free's 0.1 CPU (and on a cold project page), so a 6 s
+        # sleep often finds an empty DOM and wrongly reports "not logged in".
+        # First load after a fresh login is the slow case (up to ~2 min).
+        _deadline = time.time() + COMPOSER_TIMEOUT
+        while time.time() < _deadline:
+            try:
+                # visible + enabled, not merely present in the DOM
+                _ready = self.page.wait_for_function(
+                    """() => {
+                      const el = document.querySelector('[contenteditable="true"]');
+                      if (!el) return false;
+                      const r = el.getBoundingClientRect();
+                      if (r.width <= 0 || r.height <= 0) return false;
+                      return !el.hasAttribute('disabled') &&
+                             el.getAttribute('aria-disabled') !== 'true';
+                    }""",
+                    timeout=8000)
+                if _ready:
+                    break
+            except Exception:
+                pass
+            self._pump(seconds=0.5)
+        self._pump(seconds=2)
         caught = []
 
         def _on(resp):
@@ -591,7 +930,9 @@ class HeadlessEngine:
         try:
             box = self.page.locator("[contenteditable=true]").first
             if box.count() == 0:
-                _log("[!] generate: composer not found (logged in?)")
+                self.last_error = ("composer not found — not logged in? "
+                                   "(seed FLOW_COOKIES_JSON / PROFILE_TAR_URL)")
+                _log(f"[!] generate: {self.last_error}")
                 return None
             box.click()
             time.sleep(1)
@@ -617,7 +958,8 @@ class HeadlessEngine:
             except Exception:
                 pass
         if not caught:
-            _log("[!] generate: no ogiZ0b response observed")
+            self.last_error = "no ogiZ0b response observed (page slow/wedged?)"
+            _log(f"[!] generate: {self.last_error}")
             if _escalate:
                 _log("[*] generate: restarting engine and retrying once (self-heal)")
                 try:
@@ -631,7 +973,9 @@ class HeadlessEngine:
             return None
         body = caught[-1]
         if "UNUSUAL_ACTIVITY" in body:
-            _log("[!] generate: reCAPTCHA flagged (stealth broken?)")
+            self.last_error = ("reCAPTCHA flagged PUBLIC_ERROR_UNUSUAL_ACTIVITY "
+                               "(client IP / fingerprint scored low)")
+            _log(f"[!] generate: {self.last_error}")
             if _escalate:
                 _log("[*] generate: restarting engine and retrying once (fresh reCAPTCHA state)")
                 try:
@@ -648,8 +992,10 @@ class HeadlessEngine:
             if rid == "ogiZ0b" and data is not None:
                 items = self._parse_ogi(data)
                 if items:
+                    self.last_error = ""
                     return items
-        _log("[!] generate: response had no media")
+        self.last_error = "ogiZ0b response had no media"
+        _log(f"[!] generate: {self.last_error}")
         return None
 
     @staticmethod
@@ -773,7 +1119,7 @@ class HeadlessEngine:
         """
         Path(out_dir).mkdir(exist_ok=True)
         pid = load_state().get("project_id", "")
-        self.goto_app(f"/u/1/project/{pid}" if pid else "/")
+        self.goto_app(f"/project/{pid}" if pid else "/")
         self._pump(seconds=20)
 
         JS = r"""() => {

@@ -10,6 +10,7 @@ Exposes: FlowAPI, load_state, save_state, norm_model, CHROME, PROFILE
 from __future__ import annotations
 
 import glob
+import json
 import os
 import queue
 import threading
@@ -19,6 +20,7 @@ from pathlib import Path
 from flow_headless import (HeadlessEngine, detect_headless_shell, load_state,
                            rss_mb_of, PROFILE, ROOT, SITE_KEY)
 import flow_store as _fs
+import flow_auth as _auth
 
 ASPECTS = {"16:9": 3, "4:3": 5, "1:1": 1, "3:4": 4, "9:16": 2}
 MODELS = ["NARWHAL", "HARBOR_SEAL", "GEM_PIX_2"]  # keep list stable; BELUGA valid via norm_model
@@ -62,6 +64,164 @@ def save_state(st):
     STATE_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
 
 
+# ── pure-Python auth layer (flow_auth): jar + at token + rotation ──
+class _AuthState:
+    """Holds the cookie jar + batchexecute tokens; owns the rotation loop.
+    Boot order (handoff §4): KV -> FLOW_COOKIES_JSON env -> master-token mint."""
+
+    def __init__(self):
+        self.jar = {}                 # name -> value (the live truth)
+        self.bl = ""
+        self.fsid = ""
+        self.at = ""
+        self.at_ts = 0.0
+        self.last_rotate = 0.0
+        self.last_rotate_status = 0
+        self.last_rotate_ok = None
+        self.minted = False
+        self.source = "none"          # kv | env | file | master | browser
+        self._lock = threading.Lock()
+        self.loop = None
+
+    # -- jar management -------------------------------------------------
+    def load(self):
+        # Boot priority (handoff: "always mint from the master token"):
+        #   KV (survives deploys) -> MASTER TOKEN MINT (unbound jar) ->
+        #   FLOW_COOKIES_JSON env -> sessions file (last resorts; a phone/
+        #   desktop export is a BOUND session and RotateCookies rejects it,
+        #   so it only matters when no master token is configured).
+        kv = _auth.kv_get()
+        if kv:
+            self.jar, self.source = kv, "kv"
+        master = os.environ.get("FLOW_MASTER_TOKEN", "").strip()
+        email = (os.environ.get("FLOW_ACCOUNT_EMAIL", "")
+                 or os.environ.get("FLOW_EMAIL", "")).strip()
+        if not self.jar and master and email:
+            try:
+                self.jar = _auth.mint_cookies(
+                    email, master, os.environ.get("FLOW_ANDROID_ID",
+                                                  "0123456789abcdef"))
+                self.source = "master"
+                self.minted = True
+                print("[auth] jar MINTED from master token (unbound)", flush=True)
+            except Exception as e:
+                print(f"[auth] master mint failed: {str(e)[:200]}", flush=True)
+        if not self.jar:
+            env = os.environ.get("FLOW_COOKIES_JSON", "").strip()
+            if env:
+                try:
+                    import base64
+                    if not env.lstrip().startswith("["):
+                        env = base64.b64decode(env).decode("utf-8")
+                    jar = json.loads(env)
+                    self.jar = {c["name"]: c["value"] for c in jar
+                                if c.get("name")}
+                    self.source = "env"
+                except Exception:
+                    pass
+            if not self.jar:
+                fp = ROOT / "sessions" / "flow.cookies.full.json"
+                if fp.exists():
+                    try:
+                        jar = json.loads(fp.read_text(encoding="utf-8"))
+                        self.jar = {c["name"]: c["value"] for c in jar
+                                    if c.get("name")}
+                        self.source = "file"
+                    except Exception:
+                        pass
+        self.persist()
+        print(f"[auth] jar loaded ({len(self.jar)} cookies, source={self.source})",
+              flush=True)
+
+    def persist(self):
+        # sessions/ (engine seeds from it) + KV (survives deploys)
+        try:
+            fp = ROOT / "sessions" / "flow.cookies.full.json"
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(json.dumps(
+                [{"name": k, "value": v, "domain": ".google.com", "path": "/",
+                  "secure": k.startswith("__Secure") or k == "SAPISID"}
+                 for k, v in self.jar.items()]), encoding="utf-8")
+        except Exception:
+            pass
+        _auth.kv_put(self.jar, {"bl": self.bl, "fsid": self.fsid})
+
+    def set_jar(self, jar):
+        with self._lock:
+            self.jar = jar
+        self.persist()
+
+    # -- rotation --------------------------------------------------------
+    def rotate(self, force=False):
+        if not self.jar:
+            return False
+        if not force and (time.time() - self.last_rotate) < 300:
+            return True           # fresh enough
+        with self._lock:
+            try:
+                code, ok = _auth.rotate_psidts(self.jar)
+            except Exception:
+                return False
+        self.last_rotate = time.time()
+        self.last_rotate_status = code
+        self.last_rotate_ok = bool(ok)
+        if ok:
+            self.persist()
+            print(f"[auth] PSIDTS rotated (status={code})", flush=True)
+        else:
+            print(f"[auth] rotate status={code} (refreshed={ok})", flush=True)
+        return bool(ok)
+
+    def start_loop(self):
+        if self.loop is None and self.jar:
+            self.loop = _auth.RotationLoop(
+                lambda: self.jar, self.set_jar, interval=600,
+                on_rotate=lambda ok, code: None)
+            self.loop.start()
+
+    # -- at token --------------------------------------------------------
+    def ensure_at(self, max_age=1800):
+        if self.at and (time.time() - self.at_ts) < max_age:
+            return self.at
+        if not self.jar:
+            return ""
+        try:
+            s = _auth._session()
+            for k, v in self.jar.items():
+                s.cookies.set(k, v, domain=".google.com")
+            if not (self.bl and self.fsid):
+                self.bl, self.fsid = _auth.extract_wiz(s)
+            self.at = _auth.harvest_at(s, self.bl, self.fsid)
+            self.at_ts = time.time()
+            print(f"[auth] at harvested (len {len(self.at)})", flush=True)
+            return self.at
+        except Exception as e:
+            print(f"[auth] at harvest failed: {str(e)[:150]}", flush=True)
+            return ""
+
+    def invalidate_at(self):
+        self.at = ""
+        self.at_ts = 0.0
+
+    def info(self):
+        return {
+            "has_jar": bool(self.jar),
+            "jar_source": self.source,
+            "has_psidts": "__Secure-1PSIDTS" in self.jar,
+            "has_at": bool(self.at),
+            "at_age_s": round(time.time() - self.at_ts, 1) if self.at_ts else -1,
+            "last_rotation_ago_s": (round(time.time() - self.last_rotate, 1)
+                                    if self.last_rotate else -1),
+            "last_rotate_status": self.last_rotate_status,
+            "last_rotate_ok": self.last_rotate_ok,
+            "minted": self.minted,
+        }
+
+
+AUTH = _AuthState()
+AUTH.load()
+
+
 class FlowAPI:
     """Serialized facade: all Playwright work on one worker thread."""
 
@@ -79,6 +239,10 @@ class FlowAPI:
         self.last_engine_ok = 0.0        # epoch s of last successful engine op
         self._rebuild_inflight = False   # single-flight guard for rebuilds
         self._rebuild_lock = threading.Lock()
+        self.session_ok = None           # cached login state (None = unknown)
+        self.last_recover = 0.0          # epoch of last successful self-heal
+        self._supervisor = None
+        self._supervisor_interval = int(os.environ.get("FLOW_SUPERVISE_S", "90"))
 
     # ── worker thread (Playwright sync API is thread-bound) ──────
     def _worker(self, my_q):
@@ -207,7 +371,18 @@ class FlowAPI:
         self._ready.set()
         if not boot_engine:
             return {"ok": True, "project": ""}
-        return self._boot_engine()
+        # pure-Python auth upkeep starts regardless of the browser
+        try:
+            if AUTH.jar:
+                AUTH.start_loop()
+                threading.Thread(target=AUTH.ensure_at, daemon=True).start()
+        except Exception:
+            pass
+        r = self._boot_engine()
+        self._start_supervisor()
+        # verify login in the background; self-heals (re-seeds) if stale
+        threading.Thread(target=self.ensure_session, daemon=True).start()
+        return r
 
     def close(self):
         try:
@@ -224,6 +399,64 @@ class FlowAPI:
     def restart(self):
         """Public restart for /restart + watchdog. Synchronous, bounded."""
         return self.hard_rebuild(boot=True)
+
+    # ── supervisor: keep engine alive + session logged in (never breaks) ──
+    def ensure_session(self):
+        """Worker-side: guarantee a logged-in session, self-healing by
+        re-seeding FLOW_COOKIES_JSON / the on-disk export and rebuilding."""
+        def job():
+            return bool(self.engine and self.engine.ensure_session())
+        try:
+            ok = bool(self.run(job, timeout=300))
+            self.session_ok = ok
+            if ok:
+                self.last_recover = time.time()
+            return ok
+        except Exception as e:
+            self.session_ok = False
+            print(f"[supervisor] ensure_session failed: {str(e)[:150]}", flush=True)
+            return False
+
+    def _start_supervisor(self):
+        if self._supervisor and self._supervisor.is_alive():
+            return
+        self._supervisor = threading.Thread(target=self._supervise, daemon=True)
+        self._supervisor.start()
+        print(f"[*] supervisor on (every {self._supervisor_interval}s)", flush=True)
+
+    def _supervise(self):
+        """Forever: probe the engine, rebuild if wedged/dead, and periodically
+        verify the login (re-seeding cookies if it lapsed). Also drives the
+        pure-Python auth layer: PSIDTS rotation (10 min) + at refresh (30 min).
+        Never rebuilds while a job is running."""
+        last_sess = time.time()
+        while True:
+            time.sleep(self._supervisor_interval)
+            try:
+                # ── pure-Python auth upkeep (no browser needed) ──
+                if AUTH.jar:
+                    AUTH.rotate()                    # ≥600s cadence internally
+                    AUTH.ensure_at(max_age=1800)     # 30 min
+                if self.is_busy():
+                    continue
+                if self.engine is None or self.boot_error:
+                    print("[supervisor] engine missing -> rebuild", flush=True)
+                    self.hard_rebuild(boot=True)
+                    continue
+                # cheap liveness probe (refreshes last_engine_ok)
+                try:
+                    self.run(lambda: self.engine.page.evaluate("1"), timeout=60)
+                except Exception as e:
+                    print(f"[supervisor] liveness failed ({str(e)[:80]}) -> rebuild",
+                          flush=True)
+                    self.hard_rebuild(boot=True)
+                    continue
+                # login check every ~10 min
+                if time.time() - last_sess > 600:
+                    last_sess = time.time()
+                    self.ensure_session()
+            except Exception as e:
+                print(f"[supervisor] error: {str(e)[:150]}", flush=True)
 
     # ── fast, non-blocking status (Render health checks) ─────────
     def _base_info(self):
@@ -245,7 +478,14 @@ class FlowAPI:
             "busy": self.is_busy(), "local_run": self.local_run,
             "cookies_ready": (ROOT / "sessions" / "flow.cookies.full.json").exists()
                              or bool(os.environ.get("FLOW_COOKIES_JSON", "").strip()),
+            "proxy": bool(os.environ.get("FLOW_PROXY_URL", "").strip()),
+            "session_ok": self.session_ok,
+            "last_recover_ago_s": (round(time.time() - self.last_recover, 1)
+                                   if self.last_recover else -1),
+            **AUTH.info(),
             "boot_error": self.boot_error,
+            "last_error": ((getattr(self.engine, "last_error", "") if self.engine
+                            else "") or self.boot_error),
             "last_engine_ok_age_s": round(time.time() - self.last_engine_ok, 1)
                                     if self.last_engine_ok else -1,
         }
@@ -279,7 +519,98 @@ class FlowAPI:
         except Exception as e:
             return {"ok": False, "error": str(e)[:200], "session_ok": False}
 
+    def diag(self):
+        """Step-by-step remote self-test: does the browser boot, load Flow,
+        spoof the fingerprint, mint a reCAPTCHA token, and read the account?
+        Distinguishes {no engine, no network, not logged in, reCAPTCHA wall}."""
+        def job():
+            out: dict = {"steps": {}}
+            eng = self.engine
+            if eng is None:
+                out["verdict"] = "no engine"
+                out["steps"]["engine"] = {"ok": False, "error": self.boot_error}
+                return out
+            out["steps"]["engine"] = {"ok": True, "exe": eng.exe,
+                                      "rss_mb": round(rss_mb_of(str(PROFILE)), 1)}
+            out["steps"]["proxy"] = {"set": bool(os.environ.get("FLOW_PROXY_URL", "").strip())}
+            try:
+                url = eng.goto_app("/")
+                out["steps"]["load"] = {"ok": True, "url": url}
+            except Exception as e:
+                out["steps"]["load"] = {"ok": False, "error": str(e)[:200]}
+                out["verdict"] = "browser cannot load flow.google.com (network?)"
+                return out
+            try:
+                fp = eng.page.evaluate("""() => ({
+                    webdriver: navigator.webdriver,
+                    plugins: (navigator.plugins||[]).length,
+                    ua: navigator.userAgent,
+                    brands: (navigator.userAgentData&&navigator.userAgentData.brands)||null,
+                    url: location.href, title: document.title})""")
+                out["steps"]["fingerprint"] = {"ok": fp.get("webdriver") in (None, False)
+                                               and fp.get("plugins", 0) > 0, **fp}
+            except Exception as e:
+                out["steps"]["fingerprint"] = {"ok": False, "error": str(e)[:150]}
+            try:
+                tok = eng.mint("GENERATE")
+                out["steps"]["mint"] = {"ok": bool(tok), "token_len": len(tok or "")}
+            except Exception as e:
+                out["steps"]["mint"] = {"ok": False, "error": str(e)[:150]}
+            try:
+                c = eng.credits()
+                out["steps"]["credits"] = ({"ok": True, **c} if c else
+                                           {"ok": False, "error": "no credits response "
+                                            "(not logged in? cookies stale?)"})
+            except Exception as e:
+                out["steps"]["credits"] = {"ok": False, "error": str(e)[:150]}
+            s = out["steps"]
+            if not s.get("credits", {}).get("ok"):
+                out["verdict"] = "logged out — seed FLOW_COOKIES_JSON / PROFILE_TAR_URL"
+            elif not s.get("mint", {}).get("ok"):
+                out["verdict"] = "logged in but reCAPTCHA mint fails (page/script issue)"
+            else:
+                out["verdict"] = ("logged in + minting. If /generate still returns "
+                                  "UNUSUAL_ACTIVITY, egress IP is flagged — set "
+                                  "FLOW_PROXY_URL to a residential proxy.")
+            return out
+        try:
+            return self.run(job, timeout=150)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
     # ── jobs ─────────────────────────────────────────────────────
+    def reseed_cookies(self, cookies):
+        """Accept a fresh cookie export, persist it, and rebuild the engine so
+        the new session takes effect without a redeploy. Use when /diag reports
+        logged-out. Body: the Cookie-Editor JSON array (or {"cookies": [...]})."""
+        import json as _json
+        if isinstance(cookies, dict):
+            cookies = cookies.get("cookies") or []
+        clean = [{"name": c.get("name"), "value": c.get("value"),
+                  "domain": c.get("domain") or ".google.com",
+                  "path": c.get("path", "/"),
+                  "secure": bool(c.get("secure", True)),
+                  "httpOnly": bool(c.get("httpOnly", False)),
+                  "expirationDate": c.get("expirationDate") or c.get("expires")}
+                 for c in (cookies or []) if c.get("name") and c.get("value")]
+        if not clean:
+            return {"ok": False, "error": "no usable cookies"}
+        fp = ROOT / "sessions" / "flow.cookies.full.json"
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        blob = _json.dumps(clean)
+        fp.write_text(blob, encoding="utf-8")
+        try:
+            os.environ["FLOW_COOKIES_JSON"] = blob
+        except Exception:
+            pass
+        try:
+            (PROFILE / ".cookies_seeded").unlink()   # force re-seed
+        except Exception:
+            pass
+        r: dict = self.hard_rebuild(boot=True)
+        r["cookies"] = len(clean)
+        return r
+
     def _submit_job(self, kind, params, fn, timeout=900):
         jid = _fs.new_job(kind, params)
         _fs.jlog("job_queued", job=jid, kind=kind)
@@ -314,11 +645,20 @@ class FlowAPI:
     def submit_generate(self, prompt, model=None, aspect=None, seed=None,
                         project_id=None, count=1):
         def job():
+            # pre-flight auth upkeep: rotate PSIDTS if stale, refresh at if old
+            try:
+                if AUTH.jar:
+                    AUTH.rotate()
+                    AUTH.ensure_at(max_age=1800)
+            except Exception:
+                pass
             items = self.engine.generate(prompt, model=model, aspect=aspect,
                                          count=count, project_id=project_id,
                                          seed=seed)
             if not items:
-                return {"ok": False, "error": "generation failed"}
+                return {"ok": False,
+                        "error": getattr(self.engine, "last_error", "")
+                                 or "generation failed"}
             return {"ok": True, "media": items, **items[0]}
         return self._submit_job("generate", {
             "prompt": prompt, "model": model, "aspect": aspect,
@@ -328,7 +668,9 @@ class FlowAPI:
         def job():
             out = self.engine.upscale(media_uuid, resolution, project_id)
             if not out:
-                return {"ok": False, "error": "upscale failed"}
+                return {"ok": False,
+                        "error": getattr(self.engine, "last_error", "")
+                                 or "upscale failed"}
             return {"ok": True, "source": media_uuid, "file": str(out)}
         return self._submit_job("upscale", {
             "media_uuid": media_uuid, "resolution": resolution,
@@ -337,11 +679,19 @@ class FlowAPI:
     def generate(self, prompt, model=None, aspect=None, seed=None,
                  project_id=None, count=1):
         def job():
+            try:
+                if AUTH.jar:
+                    AUTH.rotate()
+                    AUTH.ensure_at(max_age=1800)
+            except Exception:
+                pass
             items = self.engine.generate(prompt, model=model, aspect=aspect,
                                          count=count, project_id=project_id,
                                          seed=seed)
             if not items:
-                return {"ok": False, "error": "generation failed"}
+                return {"ok": False,
+                        "error": getattr(self.engine, "last_error", "")
+                                 or "generation failed"}
             return {"ok": True, "media": items, **items[0]}
         return self.run(job, timeout=600)
 
@@ -373,18 +723,48 @@ class FlowAPI:
     def credits(self):
         def job():
             c = self.engine.credits()
+            if c is None and AUTH.jar:
+                # 401 from the engine -> invalidate the pure-HTTP at token so
+                # the supervisor re-harvests; rotate once and retry via HTTP
+                AUTH.invalidate_at()
+                try:
+                    if AUTH.rotate(force=True) and AUTH.ensure_at(max_age=0):
+                        code, data = _auth.rpc(_auth._session(), "nzlxg", [],
+                                               AUTH.at, AUTH.bl, AUTH.fsid)
+                        if code == 200 and data:
+                            AUTH.persist()
+                            c = {"credits": data[0], "raw": data}
+                except Exception:
+                    pass
             return ({"ok": True, **c} if c
                     else {"ok": False, "error": "credits failed (login?)"})
         try:
-            return self.run(job, timeout=60)
+            return self.run(job, timeout=90)
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
-    def projects(self):
-        return {"ok": True, "projects": []}
+    def projects(self, limit=30):
+        def job():
+            return {"ok": True, "projects": self.engine.projects(limit)}
+        try:
+            return self.run(job, timeout=60)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200], "projects": []}
 
     def create_project(self):
-        return None
+        def job():
+            pid = self.engine.create_project()
+            if pid:
+                st = load_state()
+                st["project_id"] = pid
+                save_state(st)
+                return {"ok": True, "project": pid}
+            return {"ok": False,
+                    "error": getattr(self.engine, "last_error", "") or "create failed"}
+        try:
+            return self.run(job, timeout=90)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
 
     def media(self, media_uuid):
         return None

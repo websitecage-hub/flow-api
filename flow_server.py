@@ -199,6 +199,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, api.session_info())
             except Exception as e:
                 self._send(500, {"ok": False, "error": str(e)[:200]})
+        elif p.path == "/diag":
+            # auth-gated: runs a real engine self-test (boot/load/mint/credits)
+            if API_KEYS and not self._auth_ok():
+                self._send(401, {"ok": False, "error": "missing/invalid API key"})
+                return
+            fn = getattr(api, "diag", None)
+            if fn is None:
+                self._send(501, {"ok": False, "error": "diag unavailable (no engine here)"})
+                return
+            try:
+                self._send(200, fn())
+            except Exception as e:
+                self._send(500, {"ok": False, "error": str(e)[:200]})
         elif p.path == "/jobs":
             import flow_store as _fs
             self._send(200, {"ok": True,
@@ -239,9 +252,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p.path == "/project":
             self._send(200, {"ok": True, "project": st.get("project_id", "")})
         elif p.path == "/project/new":
-            nid = api.create_project()
-            if nid:
-                self._send(200, {"ok": True, "project": nid})
+            res = api.create_project()
+            if isinstance(res, dict):
+                self._send(200 if res.get("ok") else 500, res)
+            elif res:
+                self._send(200, {"ok": True, "project": res})
             else:
                 self._send(500, {"ok": False, "error": "project create failed"})
         elif p.path.startswith("/media/"):
@@ -265,7 +280,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        headers={"Content-Disposition": f'attachment; filename="{Path(fp).name}"'})
         else:
             self._send(404, {"ok": False, "error": "not found",
-                             "endpoints": ["/health", "/restart", "/session",
+                             "endpoints": ["/health", "/restart", "/session", "/diag",
                                            "/generate", "/upscale", "/jobs",
                                            "/jobs/<id>", "/logs",
                                            "/history", "/media/<uuid>", "/credits",
@@ -393,6 +408,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            error=None if ok else str(j.get("error", ""))[:300])
             _fs.jlog("worker_result", job=jid, ok=ok)
             self._send(200, {"ok": True})
+        elif p.path == "/cookies":
+            # Push a fresh cookie export to a running service (phone-friendly).
+            fn = getattr(api, "reseed_cookies", None)
+            if fn is None:
+                self._send(501, {"ok": False, "error": "not available"})
+                return
+            body = j.get("cookies") if isinstance(j, dict) else None
+            if j and j.get("cookies") is None and isinstance(j, list):
+                body = j
+            try:
+                self._send(200, fn(body if body is not None else j))
+            except Exception as e:
+                self._send(500, {"ok": False, "error": str(e)[:200]})
         elif p.path == "/project":
             pid = (j.get("projectId") or "").strip()
             if not pid:
@@ -515,8 +543,9 @@ def main():
                 print(f"[!] boot failed: {api.boot_error}", flush=True)
 
         threading.Thread(target=_bg, daemon=True).start()
-        # watchdog: auto-restart a dead engine so generation never goes black
-        threading.Thread(target=_watchdog, daemon=True).start()
+        # NOTE: the engine facade now owns supervision (liveness probe + session
+        # self-heal) via FlowAPI._supervise(), started in api.start(). No second
+        # watchdog here — two rebuild loops would thrash the engine.
     else:
         api.local_run = False
         try:

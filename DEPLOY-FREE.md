@@ -1,23 +1,20 @@
 # Deploy Flow API on Render FREE tier (512 MB) — self-contained
 
-This replaces the "split-brain" setup (paid Render + a home PC worker). The
-whole API, browser engine included, now runs on Render's **free** plan.
+The whole API, browser engine included, runs on Render's **free** plan:
+one service, one Dockerfile (`./Dockerfile`), pointed at by `render.yaml`.
 
-## Why the old conclusion was wrong
+## Why this fits 512 MB (measured on x86_64 with this engine)
 
-The repo said free tier OOMs and you need a paid plan plus a home worker.
-That was measured with full Chrome in `--headless=new` mode, which runs an
-~11-process renderer tree. Measured on a Linux x86_64 box:
+| engine | RSS with flow.google.com loaded | processes |
+|---|---|---|
+| full Chromium, `--headless=new` (old `flow_api.FlowEngine`) | **1.65 GB** | 9 |
+| `chrome-headless-shell` (`flow_headless.py`) | **~128 MB** | 1 |
 
-| engine | RSS with flow.google.com loaded |
-|---|---|
-| full Chrome, `--headless=new` (old) | **1213 MB** |
-| `chrome-headless-shell` (this) | **115 MB** (118 MB peak while minting) |
-| + Python, Playwright, sqlite, server | ~125 MB total |
-
-`chrome-headless-shell` is Chrome's *other* headless binary — the lightweight
-one — built for exactly this. Single process. It runs the full Flow app and
-mints reCAPTCHA Enterprise tokens just fine (verified: 2489-char token, 254 ms).
+`chrome-headless-shell` is Chrome's *lightweight* single-process headless
+binary. It runs the whole Flow app and mints reCAPTCHA Enterprise tokens
+(verified: 2.4 kB token). Full Chromium OOM-kills free tier — which is why the
+repo once wrongly concluded "free tier is impossible". `render.yaml` →
+`./Dockerfile` installs **only** `chromium-headless-shell`, never `chromium`.
 
 ## 1. Push
 
@@ -29,15 +26,22 @@ git push
 ## 2. Create the service (blueprint)
 
 Render → **New → Blueprint** → pick this repo → it reads `render.yaml`
-(already set to `plan: free`, `Dockerfile.headless`, `FLOW_ENGINE=headless`).
+(`plan: free`, `dockerfilePath: ./Dockerfile`, `FLOW_ENGINE=headless`).
 
-Then fill the two `sync: false` values:
+Then fill the `sync: false` values:
 - `FLOW_PROJECT` — your Flow project uuid
 - `API_KEYS` — e.g. `cms1:<a-long-random-secret>`
+- `FLOW_COOKIES_JSON` — base64 cookie export (see §4)
 
-Optional: `PROFILE_TAR_URL` — see step 3.
+Optional: `PROFILE_TAR_URL` (see §4), `FLOW_PROXY_URL` (see §7).
 
-## 3. The one thing free tier can't do: keep a login
+## 3. Keep it awake
+
+Free instances sleep after 15 min idle (~730 h/month ≈ one always-on service;
+the free allowance is 750 h). Point an UptimeRobot HTTP monitor at
+`https://<service>.onrender.com/health` every 5 minutes.
+
+## 4. The one thing free tier can't do: keep a login
 
 Render free instances have **no persistent disk**, so the logged-in browser
 profile is wiped on every deploy/restart. Pick whichever is easiest for you.
@@ -88,18 +92,33 @@ tar -czf profile.tgz -C profile-copy .
 Either way, treat cookies/tarball as a **secret** (live Google session). Never
 commit them.
 
-## 4. Verify
+## 5. Verify (this is the important part)
 
 ```bash
-curl https://<your-service>.onrender.com/health
-# {"ok":true,"engine":"chrome-headless-shell","rss_mb":123.0,...}
+curl https://<service>.onrender.com/health
+# {"ok":true,"engine":"chrome-headless-shell","rss_mb":129.8,
+#  "engine_alive":true,"cookies_ready":true,"proxy":false,
+#  "boot_error":"","last_error":""}
 
-curl -H "Authorization: Bearer <secret>" \
-     "https://<your-service>.onrender.com/session"
-# session_ok:true once the profile is seeded
+curl -H "Authorization: Bearer <secret>" https://<service>.onrender.com/diag
 ```
 
-## 5. Use it
+`/diag` runs a real engine self-test and returns a **verdict** naming the
+exact failing stage:
+
+```json
+{"steps":{"engine":{"ok":true,"rss_mb":129.8},
+          "load":{"ok":true,"url":"https://flow.google.com/u/1/project/<id>"},
+          "fingerprint":{"ok":true,"webdriver":null,"plugins":5},
+          "mint":{"ok":true,"token_len":2425},
+          "credits":{"ok":true,"credits":50}},
+ "verdict":"logged in + minting. If /generate still returns UNUSUAL_ACTIVITY,
+            egress IP is flagged — set FLOW_PROXY_URL to a residential proxy."}
+```
+
+`/health.last_error` also shows why the last `/generate` failed.
+
+## 6. Use it
 
 ```bash
 curl -X POST https://<your-service>.onrender.com/generate \
@@ -108,6 +127,22 @@ curl -X POST https://<your-service>.onrender.com/generate \
 # -> 202 {"job":"gen-...","poll":"/jobs/gen-..."}
 curl -H "Authorization: Bearer <secret>" https://<your-service>.onrender.com/jobs/gen-...
 ```
+
+## 7. If generation returns PUBLIC_ERROR_UNUSUAL_ACTIVITY
+
+reCAPTCHA Enterprise scores the **client IP**. Render runs on datacenter IPs
+(AWS), which can be flagged even with a perfect browser fingerprint — while
+your home (residential) IP passes. `/diag` will show `"mint":{"ok":true}` but
+`/generate` still gets `UNUSUAL_ACTIVITY`.
+
+Fix: route only the browser through a residential proxy:
+
+```
+FLOW_PROXY_URL=http://user:pass@residential-host:port
+```
+
+Set it in the Render dashboard (sync:false). `/health.proxy` then reads `true`.
+Nothing else changes.
 
 ## Notes / limits
 

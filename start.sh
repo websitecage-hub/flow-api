@@ -1,35 +1,41 @@
 #!/usr/bin/env bash
+# Render free-tier entrypoint. Finds the light browser, seeds the login, and
+# starts flow_server.py (which boots the chrome-headless-shell engine inline).
 set -e
 
-# Persistent dirs (Render Disk mounted at /data)
-mkdir -p "$FLOW_PROFILE" "$FLOW_OUT" /data/sessions /data/logs
+export FLOW_ENGINE="${FLOW_ENGINE:-headless}"
+FLOW_PROFILE="${FLOW_PROFILE:-/app/profile-copy}"
+FLOW_OUT="${FLOW_OUT:-/app/outputs}"
+cd "$(dirname "$0")"
 
-# Locate the browser binary and export it, so flow_api's engine never has to
-# guess the path. FLOW_ENGINE=headless -> the tiny single-process
-# chrome-headless-shell (~120 MB, fits Render free 512 MB); else full Chromium.
-if [ "${FLOW_ENGINE}" = "headless" ]; then
-  CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name chrome-headless-shell -type f 2>/dev/null | head -1)
-else
-  CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name chrome -type f 2>/dev/null | head -1)
+mkdir -p "$FLOW_PROFILE" "$FLOW_OUT" sessions logs outputs
+
+# Locate the browser binary. FLOW_ENGINE=headless -> the tiny single-process
+# chrome-headless-shell (~128 MB, fits Render free 512 MB); else full Chromium.
+if [ -z "${FLOW_CHROME:-}" ]; then
+  if [ "$FLOW_ENGINE" = "headless" ]; then
+    FLOW_CHROME=$(find /root/.cache/ms-playwright /ms-playwright "$HOME/.cache/ms-playwright" \
+        -type f -name chrome-headless-shell 2>/dev/null | head -1)
+  fi
+  [ -z "${FLOW_CHROME:-}" ] && \
+    FLOW_CHROME=$(find /root/.cache/ms-playwright /ms-playwright "$HOME/.cache/ms-playwright" \
+        -type f -name chrome 2>/dev/null | head -1)
 fi
-if [ -z "$CHROME_BIN" ]; then
-  CHROME_BIN=$(find /root/.cache/ms-playwright /ms-playwright -name headless_shell -type f 2>/dev/null | head -1)
-fi
-if [ -n "$CHROME_BIN" ]; then
-  export FLOW_CHROME="$CHROME_BIN"
-  echo "[start] using chromium: $CHROME_BIN"
+if [ -n "${FLOW_CHROME:-}" ]; then
+  export FLOW_CHROME
+  echo "[start] browser: $FLOW_CHROME"
 else
-  echo "[start] WARNING: no chromium binary found"
+  echo "[start] WARNING: no browser binary found"
 fi
 
-# One-time seed: if a profile tarball URL is provided and the profile dir is
-# empty, download + extract it so you don't have to log in by hand again.
-if [ -n "$PROFILE_TAR_URL" ] && [ ! -d "$FLOW_PROFILE/Default" ]; then
-  echo "[start] seeding profile from $PROFILE_TAR_URL"
+# One-time seed: if PROFILE_TAR_URL is set and the profile is empty, unpack it
+# (free tier has no persistent disk, so the login must be re-seeded each boot).
+if [ -n "${PROFILE_TAR_URL:-}" ] && [ ! -d "$FLOW_PROFILE/Default" ]; then
+  echo "[start] seeding profile from PROFILE_TAR_URL"
   curl -fsSL "$PROFILE_TAR_URL" -o /tmp/profile.tar.gz \
     && tar -xzf /tmp/profile.tar.gz -C "$FLOW_PROFILE" \
     && echo "[start] profile seeded" \
-    || echo "[start] profile seed failed; will try auto-login"
+    || echo "[start] profile seed failed"
 fi
 
 exec python -u flow_server.py --host 0.0.0.0 --port "${PORT:-8787}"

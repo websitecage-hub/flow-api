@@ -3,7 +3,9 @@
 # (requirements.txt); server imports them lazily / not at all.
 playwright>=1.40
 curl_cffi>=0.5
+gpsoauth>=1.4
 
 # NOTE for FLOW_ENGINE=headless: the Dockerfile runs
 #   playwright install --with-deps chromium-headless-shell
 # which pulls the tiny single-process browser (~120 MB RSS) used on free tier.
+# gpsoauth powers flow_auth.mint_cookies() (master token -> full cookie jar).
