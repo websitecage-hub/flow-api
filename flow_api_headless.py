@@ -96,7 +96,20 @@ class _AuthState:
         master = os.environ.get("FLOW_MASTER_TOKEN", "").strip()
         email = (os.environ.get("FLOW_ACCOUNT_EMAIL", "")
                  or os.environ.get("FLOW_EMAIL", "")).strip()
-        if not self.jar and master and email:
+        # OOM GUARD: skip mint if an on-disk jar already exists — a fresh mint
+        # + browser boot together spike past 512 MB on Render free. The disk
+        # jar was minted+rotated by a previous boot; reuse it, let the
+        # rotation loop refresh it. Only mint when nothing usable exists.
+        fp = ROOT / "sessions" / "flow.cookies.full.json"
+        have_disk_jar = False
+        if fp.exists():
+            try:
+                jar = json.loads(fp.read_text(encoding="utf-8"))
+                if any(c.get("name") == "__Secure-1PSID" for c in jar):
+                    have_disk_jar = True
+            except Exception:
+                pass
+        if not self.jar and master and email and not have_disk_jar:
             try:
                 self.jar = _auth.mint_cookies(
                     email, master, os.environ.get("FLOW_ANDROID_ID",
@@ -119,16 +132,14 @@ class _AuthState:
                     self.source = "env"
                 except Exception:
                     pass
-            if not self.jar:
-                fp = ROOT / "sessions" / "flow.cookies.full.json"
-                if fp.exists():
-                    try:
-                        jar = json.loads(fp.read_text(encoding="utf-8"))
-                        self.jar = {c["name"]: c["value"] for c in jar
-                                    if c.get("name")}
-                        self.source = "file"
-                    except Exception:
-                        pass
+            if not self.jar and fp.exists():
+                try:
+                    jar = json.loads(fp.read_text(encoding="utf-8"))
+                    self.jar = {c["name"]: c["value"] for c in jar
+                                if c.get("name")}
+                    self.source = "file"
+                except Exception:
+                    pass
         self.persist()
         print(f"[auth] jar loaded ({len(self.jar)} cookies, source={self.source})",
               flush=True)
@@ -371,11 +382,13 @@ class FlowAPI:
         self._ready.set()
         if not boot_engine:
             return {"ok": True, "project": ""}
-        # pure-Python auth upkeep starts regardless of the browser
+        # pure-Python auth upkeep starts regardless of the browser — but
+        # DELAYED: at-harvest spawns a full TLS stack; firing it during the
+        # browser's peak boot memory OOM-kills free tier. Supervisor pass #1
+        # (90s) is early enough.
         try:
             if AUTH.jar:
-                AUTH.start_loop()
-                threading.Thread(target=AUTH.ensure_at, daemon=True).start()
+                self._start_supervisor()
         except Exception:
             pass
         r = self._boot_engine()
