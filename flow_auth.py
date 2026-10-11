@@ -54,11 +54,20 @@ BE_PATH = "/_/AiSandboxAngularFrontend/data/batchexecute"
 UNBOUND_FEATURES = "--disable-features=EnableBoundSessionCredentials,DeviceBoundSessions"
 
 
+_SHARE_SESS: Optional["cffi.Session"] = None
+
+
 def _session() -> "cffi.Session":
-    try:
-        return cffi.Session(impersonate="chrome131")
-    except Exception:
-        return cffi.Session()
+    """SHARED curl_cffi session (chrome131 impersonation allocates ~50-80 MB
+    of TLS/BoringSSL state — creating one per rotate/harvest call OOM-kills
+    a 512 MB container within a few supervisor passes)."""
+    global _SHARE_SESS
+    if _SHARE_SESS is None:
+        try:
+            _SHARE_SESS = cffi.Session(impersonate="chrome131")
+        except Exception:
+            _SHARE_SESS = cffi.Session()
+    return _SHARE_SESS
 
 
 # ─────────────────────────────────────────────────────────────────
