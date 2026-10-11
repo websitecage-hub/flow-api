@@ -452,6 +452,17 @@ class HeadlessEngine:
         except Exception:
             pass
         try:
+            # MEMORY GUARD (free tier 512MB): the Flow pages autoplay videos
+            # and load heavy images — the renderer alone can spike past the
+            # container limit. The engine only needs DOM+JS+XHR, so abort
+            # media requests. NEVER abort batchexecute/fetch XHRs.
+            self.ctx.route("**/*.{mp4,webm,avi,mp3,wav,ogg}", lambda route: route.abort())
+            self.ctx.route("**/*", lambda route: (
+                route.abort() if route.request.resource_type in ("media", "font")
+                else route.continue_()))
+        except Exception:
+            pass
+        try:
             # THE THING: mask the HeadlessChrome client-hint leak (wire + JS).
             self.ctx.add_init_script(UAD_OVERRIDE_JS)
             self.ctx.route("**/*", _scrub_ch_headers)
