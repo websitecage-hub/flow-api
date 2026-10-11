@@ -458,8 +458,8 @@ class HeadlessEngine:
             # media requests. NEVER abort batchexecute/fetch XHRs.
             self.ctx.route("**/*.{mp4,webm,avi,mp3,wav,ogg}", lambda route: route.abort())
             self.ctx.route("**/*", lambda route: (
-                route.abort() if route.request.resource_type in ("media", "font")
-                else route.continue_()))
+                route.abort() if route.request.resource_type in
+                ("image", "media", "font") else route.continue_()))
         except Exception:
             pass
         try:
