@@ -287,10 +287,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                            "/projects", "/project"]})
 
     def do_POST(self):
+        # Drain the request body FIRST — if we 401/429 before reading it, the
+        # leftover bytes corrupt the next request on a keep-alive connection
+        # (client sees "Bad request syntax '<json body>GET /... HTTP/1.1'").
+        try:
+            j = self._read_json()
+        except Exception:
+            j = {}
         if not self._gate(is_post=True, need_auth=True):
             return
         p = urllib.parse.urlparse(self.path)
-        j = self._read_json()
         qs = urllib.parse.parse_qs(p.query)
         wait = (qs.get("wait", ["0"])[0] == "1")
         if p.path == "/generate":
