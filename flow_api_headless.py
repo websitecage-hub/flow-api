@@ -342,8 +342,12 @@ class FlowAPI:
                 self._active -= 1
 
     def is_busy(self):
+        # ANY in-flight job (>=1) means the worker is occupied — the old
+        # '> 1' treated the running generate itself as "not busy", letting
+        # the supervisor's liveness probe queue behind it, time out, and
+        # hard-rebuild the browser OUT from under the running job.
         try:
-            return self._active > 1 or not self._q.empty()
+            return self._active >= 1 or not self._q.empty()
         except Exception:
             return False
 
