@@ -302,6 +302,25 @@ class FlowAPI:
             print(f"[*] SIGKILLed {killed} stray browser process(es)", flush=True)
         return killed
 
+    def _kill_driver_procs(self):
+        """SIGKILL playwright node drivers that belong to dead engines.
+        Each leaked driver costs ~120MB — fatal on 512MB free tier."""
+        import signal
+        killed = 0
+        for p in glob.glob("/proc/[0-9]*"):
+            try:
+                cmd = open(p + "/cmdline", "rb").read().replace(
+                    b"\0", b" ").decode("utf-8", "replace")
+                if ("node" in cmd and ("playwright" in cmd or "driver" in cmd)
+                        and "package" in cmd):
+                    os.kill(int(p.split("/")[-1]), signal.SIGKILL)
+                    killed += 1
+            except Exception:
+                pass
+        if killed:
+            print(f"[*] SIGKILLed {killed} stale node driver(s)", flush=True)
+        return killed
+
     def run(self, fn, timeout=600, _boot=False):
         """Enqueue fn on the worker and wait up to `timeout`. NEVER holds a
         lock while waiting — one slow call must not block every other call.
@@ -360,7 +379,16 @@ class FlowAPI:
             self._rebuild_inflight = True
             try:
                 print("[*] hard rebuild: killing browser + resetting engine", flush=True)
+                # Stop the old engine's playwright driver FIRST — its node
+                # process (~120MB) otherwise leaks on every rebuild and the
+                # leaked drivers pushed the container past 512MB.
+                try:
+                    if self.engine is not None and self.engine.pw is not None:
+                        self.engine.pw.stop()
+                except Exception:
+                    pass
                 self._kill_browser_procs()
+                self._kill_driver_procs()
                 self.engine = None
                 self._thread = None          # abandon wedged worker
                 self._q = queue.Queue()
