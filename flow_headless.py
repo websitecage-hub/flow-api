@@ -67,11 +67,10 @@ STATE_FILE = ROOT / "sessions" / "flow_api_state.json"
 COOKIES_FILE = ROOT / "sessions" / "flow.cookies.full.json"
 MEM_GUARD_MB = int(os.environ.get("FLOW_MEM_GUARD_MB", "420"))
 
-# V8 old-space cap for the renderer. Too low -> the Flow Angular app's JS heap
-# overflows and the renderer crashes (no ogiZ0b response -> generation "goes
-# black"); too high -> risks the 512 MB container OOM-kill. 224 MB is measured
-# safe with the light engine (~130 MB process RSS) on a 512 MB box.
-JS_HEAP_MB = int(os.environ.get("FLOW_JS_HEAP_MB", "224"))
+# V8 old-space cap for the renderer. MEM-SPEC: 96 MB — tight but sufficient
+# now that images/media/fonts are blocked (the Angular app's heap churn was
+# mostly decode buffers, not JS objects). Env knob FLOW_JS_HEAP_MB overrides.
+JS_HEAP_MB = int(os.environ.get("FLOW_JS_HEAP_MB", "96"))
 
 # How long to wait for the Flow composer to hydrate before generating.
 # Render free's 0.1 CPU can take much longer than a local box on a cold page.
@@ -215,6 +214,36 @@ def rss_mb_of(proc_substr: str) -> float:
         except Exception:
             pass
     return total / 1024.0
+
+
+def read_rss_mb() -> int:
+    """RSS of THIS python process (MB)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def total_tree_rss_mb() -> float:
+    """python + every chrome/headless child (MB). The REAL container number
+    Render's OOM killer sees."""
+    total = read_rss_mb()
+    for p in glob.glob("/proc/[0-9]*"):
+        try:
+            cmd = open(p + "/cmdline", "rb").read()
+            low = cmd.lower()
+            if (b"chrome" in low or b"headless" in low) and b"playwright" not in low:
+                for line in open(p + "/status"):
+                    if line.startswith("VmRSS:"):
+                        total += int(line.split()[1]) / 1024.0
+                        break
+        except Exception:
+            pass
+    return total
 
 
 def load_state() -> dict:
@@ -421,6 +450,41 @@ class HeadlessEngine:
             _log(f"[!] RSS already {used:.0f} MB > guard {MEM_GUARD_MB} MB")
         from playwright.sync_api import sync_playwright
         self.pw = sync_playwright().start()
+        # MEM-SPEC launch args (512MB free tier): cap V8 heap, merge renderer
+        # into the browser process, prevent per-origin renderer spawning.
+        # FLOW_SINGLE_PROCESS=0 drops --single-process (fallback if it hangs).
+        args = [
+            "--no-sandbox", "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-software-rasterizer",
+            # reCAPTCHA Enterprise flags navigator.webdriver / automation;
+            # this removes it. Verified: generation passes with it.
+            "--disable-blink-features=AutomationControlled",
+            "--disable-extensions", "--disable-plugins",
+            "--disable-background-networking",
+            # keep the single renderer awake on a headless box
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-breakpad", "--disable-crash-reporter",
+            "--disable-hang-monitor", "--disable-sync", "--disable-translate",
+            "--metrics-recording-only",
+            "--no-first-run", "--no-default-browser-check", "--mute-audio",
+            # site-per-process off: no renderer per origin; BackForwardCache
+            # off: no bfcache page duplicates; Translate/MediaRouter/etc off.
+            "--disable-features=Translate,BackForwardCache,AcceptCHFrame,"
+            "MediaRouter,OptimizationHints,"
+            "ProcessPerSiteUpToMainFrameThreshold,IsolateOrigins,"
+            "site-per-process,"
+            # AUTH-CRITICAL: launch UNBOUND so the session's PSIDTS pair
+            # accepts server-side rotation (flow_auth.rotate_psidts).
+            # Bound sessions 401 RotateCookies from datacenter IPs.
+            "EnableBoundSessionCredentials,DeviceBoundSessions",
+            f"--js-flags=--max-old-space-size={JS_HEAP_MB}",
+            "--renderer-process-limit=1",
+        ]
+        if os.environ.get("FLOW_SINGLE_PROCESS", "1") != "0":
+            args.append("--single-process")
         self.ctx = self.pw.chromium.launch_persistent_context(
             str(PROFILE), executable_path=self.exe, headless=True,
             bypass_csp=True,               # needed for in-page script inject
@@ -428,38 +492,40 @@ class HeadlessEngine:
             ignore_default_args=["--enable-automation"],
             viewport={"width": 1280, "height": 900},
             proxy=_proxy_config(),         # optional residential egress
-            args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage", "--disable-gpu",
-                # reCAPTCHA Enterprise flags navigator.webdriver / automation;
-                # this removes it. Verified: generation passes with it.
-                "--disable-blink-features=AutomationControlled",
-                # keep the single renderer awake on a headless box
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--no-first-run", "--no-default-browser-check",
-                # memory trims that matter at 512 MB
-                "--disable-extensions", "--disable-sync",
-                # AUTH-CRITICAL: launch UNBOUND so the session's PSIDTS pair
-                # accepts server-side rotation (flow_auth.rotate_psidts).
-                # Bound sessions 401 RotateCookies from datacenter IPs.
-                UNBOUND_FEATURES,
-                f"--js-flags=--max-old-space-size={JS_HEAP_MB}",
-            ])
+            args=args)
         try:
             self.ctx.add_init_script(STEALTH_JS)
         except Exception:
             pass
         try:
-            # MEMORY GUARD (free tier 512MB): the Flow pages autoplay videos
-            # and load heavy images — the renderer alone can spike past the
-            # container limit. The engine only needs DOM+JS+XHR, so abort
-            # media requests. NEVER abort batchexecute/fetch XHRs.
-            self.ctx.route("**/*.{mp4,webm,avi,mp3,wav,ogg}", lambda route: route.abort())
-            self.ctx.route("**/*", lambda route: (
-                route.abort() if route.request.resource_type in
-                ("image", "media", "font") else route.continue_()))
+            # MEM-SPEC resource blocking (saves 40-80 MB): allow the app's
+            # own XHRs + HTML + scripts, abort decorative images/media/fonts
+            # EXCEPT the avatar/asset thumbnails the composer needs, and
+            # abort ALL third-party hosts (analytics, tracking, telemetry).
+            def block_heavy(route):
+                r = route.request
+                u = r.url
+                rt = r.resource_type
+                try:
+                    if "batchexecute" in u or "/api/" in u:
+                        return route.continue_()
+                    if any(h in u for h in ("flow.google.com",
+                                            "flow-content.google",
+                                            "accounts.google.com",
+                                            "lh3.googleusercontent.com",
+                                            "www.google.com",
+                                            "www.gstatic.com")):
+                        if rt in ("image", "media", "font", "manifest"):
+                            if "/user-avatar/" not in u and "/asb/" not in u:
+                                return route.abort()
+                        return route.continue_()
+                    return route.abort()   # everything third-party: dead weight
+                except Exception:
+                    try:
+                        return route.continue_()
+                    except Exception:
+                        pass
+            self.ctx.route("**/*", block_heavy)
         except Exception:
             pass
         try:

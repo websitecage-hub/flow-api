@@ -18,7 +18,8 @@ import time
 from pathlib import Path
 
 from flow_headless import (HeadlessEngine, detect_headless_shell, load_state,
-                           rss_mb_of, PROFILE, ROOT, SITE_KEY)
+                           rss_mb_of, total_tree_rss_mb, read_rss_mb,
+                           MEM_GUARD_MB, PROFILE, ROOT, SITE_KEY)
 import flow_store as _fs
 import flow_auth as _auth
 
@@ -439,9 +440,13 @@ class FlowAPI:
         """Forever: probe the engine, rebuild if wedged/dead, and periodically
         verify the login (re-seeding cookies if it lapsed). Also drives the
         pure-Python auth layer: PSIDTS rotation (10 min) + at refresh (30 min).
-        Never rebuilds while a job is running."""
+        Never rebuilds while a job is running.
+        MEM-SPEC: also enforces the total process-tree memory guard —
+        python + chrome RSS > FLOW_MEM_GUARD_MB (400) triggers a hard rebuild
+        (fresh browser) instead of letting Render's OOM killer do it randomly."""
         boot_ts = time.time()
         last_sess = time.time() + 120   # first session check ~2min after boot
+        last_leak_rebuild = 0.0
         while True:
             time.sleep(self._supervisor_interval)
             try:
@@ -450,6 +455,20 @@ class FlowAPI:
                     AUTH.rotate()                    # ≥600s cadence internally
                     if (time.time() - boot_ts) > 120:
                         AUTH.ensure_at(max_age=1800)  # 30 min; skip boot race
+                # ── MEM-SPEC watchdog: total tree RSS guard ──
+                try:
+                    mb = total_tree_rss_mb()
+                    if mb > MEM_GUARD_MB and not self.is_busy():
+                        if time.time() - last_leak_rebuild > 600:
+                            print(f"[mem] RSS {mb:.0f} MB > guard "
+                                  f"{MEM_GUARD_MB} MB — hard rebuild", flush=True)
+                            last_leak_rebuild = time.time()
+                            self.hard_rebuild(boot=True)
+                            import gc
+                            gc.collect()
+                            continue
+                except Exception:
+                    pass
                 if self.is_busy():
                     continue
                 # give the boot engine time to settle before any rebuild
@@ -479,16 +498,24 @@ class FlowAPI:
         st = load_state()
         stale = (time.time() - self.last_engine_ok) > 180 if self.last_engine_ok else True
         rss = 0.0
+        rss_py = read_rss_mb()
         try:
-            rss = round(rss_mb_of(str(PROFILE)), 1)
+            rss = round(total_tree_rss_mb(), 1)
         except Exception:
-            pass
+            try:
+                rss = round(rss_mb_of(str(PROFILE)), 1)
+            except Exception:
+                pass
         return {
             "ok": True,
             "engine_alive": self.engine is not None,
             "engine_responsive": not stale,
             "engine": "chrome-headless-shell",
-            "rss_mb": rss,
+            "rss_total_mb": rss,
+            "rss_python_mb": rss_py,
+            "rss_chrome_mb": round(max(rss - rss_py, 0), 1),
+            "rss_mb": rss,          # backward compat
+            "mem_guard_mb": MEM_GUARD_MB,
             "project": st.get("project_id", ""),
             "model": st.get("model", "BELUGA"),
             "busy": self.is_busy(), "local_run": self.local_run,

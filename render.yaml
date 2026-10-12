@@ -28,7 +28,7 @@ services:
       - key: FLOW_OUT
         value: /app/outputs
       - key: FLOW_MEM_GUARD_MB
-        value: "420"
+        value: "400"              # watchdog: rebuild browser above this RSS
       - key: FLOW_PROJECT
         sync: false               # your Flow project uuid
       - key: FLOW_MODEL
@@ -56,7 +56,9 @@ services:
       - key: FLOW_PROXY_URL
         sync: false               # optional: residential proxy for the browser
       - key: FLOW_JS_HEAP_MB
-        value: "224"              # V8 old-space cap (avoid renderer OOM crash)
+        value: "96"               # V8 old-space cap (media blocked; 96 is enough)
+      - key: FLOW_SINGLE_PROCESS
+        value: "1"                # merge renderer into main (saves ~80 MB)
       - key: RATE_POST_PER_MIN
         value: "20"
       - key: RATE_GET_PER_MIN
