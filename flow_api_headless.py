@@ -400,6 +400,16 @@ class FlowAPI:
                 self._rebuild_inflight = False
 
     def _boot_engine(self):
+        # MEM: stop any previous engine's playwright driver + browser first —
+        # replacing self.engine without stopping the old one leaks a full
+        # stack (~315MB: chrome 110 + node driver 120 + buffers) per boot.
+        try:
+            if self.engine is not None and self.engine.pw is not None:
+                self.engine.pw.stop()
+        except Exception:
+            pass
+        self._kill_browser_procs()
+        self._kill_driver_procs()
         def _boot():
             eng = HeadlessEngine()
             eng.start()
