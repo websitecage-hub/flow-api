@@ -934,9 +934,16 @@ class HeadlessEngine:
         fresh reCAPTCHA iframe/token. This is what keeps generation from "going
         black" when Google's bot scoring shifts (2026-10-08 incident).
         """
+        # MEM/SELF-HEAL FIX: never restart the engine mid-generation — the
+        # caller's page dies with 'Target closed' and the job crashes.
+        # session_ok() can false-negative (slow nzlxg on 0.1 CPU); if it
+        # fails, just log and CONTINUE — the composer drive below surfaces
+        # the real error. ensure_session's browser restart is only safe
+        # between jobs (supervisor path), never inside one.
         if not self.session_ok():
-            _log("[*] generate: not logged in -> ensure_session()")
-            self.ensure_session()
+            _log("[*] generate: session check failed — continuing without "
+                 "restart (mid-job restart kills the page)")
+            self.last_error = ""
         pid = project_id or load_state().get("project_id", "")
         if not pid:
             # auto-create a project so generation "just works" with no id set

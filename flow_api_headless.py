@@ -318,11 +318,20 @@ class FlowAPI:
             self._active += 1
         try:
             if not ev.wait(timeout):
-                if not _boot and not self._rebuild_inflight:
+                # TIMEOUT SAFETY: only hard-rebuild when THIS caller is the
+                # only job. If other jobs are in flight, the worker is busy
+                # (0.1 CPU makes everything slow) — rebuilding would kill
+                # their pages mid-flight ('Target closed' crashes).
+                with self._counter_lock:
+                    others_active = self._active > 1
+                if not _boot and not self._rebuild_inflight and not others_active:
                     try:
                         self.hard_rebuild()
                     except Exception as e:
                         print(f"[!] auto rebuild failed: {str(e)[:120]}", flush=True)
+                elif others_active:
+                    print("[!] engine job timed out but other jobs are "
+                          "in-flight — skipping rebuild", flush=True)
                 raise TimeoutError(f"engine job timed out after {timeout}s")
             if "err" in res:
                 raise res["err"]
