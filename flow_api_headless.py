@@ -557,6 +557,20 @@ class FlowAPI:
                 rss = round(rss_mb_of(str(PROFILE)), 1)
             except Exception:
                 pass
+        # chrome's own JS heap (via CDP) — distinguishes 'chrome fat' from
+        # 'too many stacks' when rss_total is huge
+        js_heap = 0
+        try:
+            if self.engine is not None and self.engine.page is not None:
+                m = self.engine.page.context.new_cdp_session(
+                    self.engine.page).send(
+                    "Performance.getMetrics")
+                for mm in m.get("metrics", []):
+                    if mm["name"] == "JSHeapUsedSize":
+                        js_heap = round(mm["value"] / 1048576, 1)
+                        break
+        except Exception:
+            pass
         return {
             "ok": True,
             "engine_alive": self.engine is not None,
@@ -565,6 +579,8 @@ class FlowAPI:
             "rss_total_mb": rss,
             "rss_python_mb": rss_py,
             "rss_chrome_mb": round(max(rss - rss_py, 0), 1),
+            "js_heap_mb": js_heap,
+            "stacks_est": round(max(rss, 1) / 320.0, 1),  # ~320MB per full stack
             "rss_mb": rss,          # backward compat
             "mem_guard_mb": MEM_GUARD_MB,
             "project": st.get("project_id", ""),
