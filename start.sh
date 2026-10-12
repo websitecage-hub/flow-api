@@ -3,6 +3,10 @@
 # starts flow_server.py (which boots the chrome-headless-shell engine inline).
 set -e
 
+# MEM: the playwright node driver silently eats ~120MB. Cap its V8 heap so
+# it stays lean — it only shuffles CDP messages, it never needs more.
+export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=96"
+
 export FLOW_ENGINE="${FLOW_ENGINE:-headless}"
 FLOW_PROFILE="${FLOW_PROFILE:-/app/profile-copy}"
 FLOW_OUT="${FLOW_OUT:-/app/outputs}"

@@ -236,7 +236,11 @@ def total_tree_rss_mb() -> float:
         try:
             cmd = open(p + "/cmdline", "rb").read()
             low = cmd.lower()
-            if (b"chrome" in low or b"headless" in low) and b"playwright" not in low:
+            # chrome tree + the playwright node driver (~120MB!) — both live
+            # in the container and Render's OOM killer sees them all.
+            is_chrome = (b"chrome" in low or b"headless" in low)
+            is_driver = b"node" in low and b"playwright" in low
+            if is_chrome or is_driver:
                 for line in open(p + "/status"):
                     if line.startswith("VmRSS:"):
                         total += int(line.split()[1]) / 1024.0
