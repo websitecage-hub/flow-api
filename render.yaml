@@ -56,9 +56,9 @@ services:
       - key: FLOW_PROXY_URL
         sync: false               # optional: residential proxy for the browser
       - key: FLOW_JS_HEAP_MB
-        value: "96"               # V8 old-space cap (media blocked; 96 is enough)
+        value: "128"              # V8 old-space cap (96 too tight for Angular app)
       - key: FLOW_SINGLE_PROCESS
-        value: "1"                # merge renderer into main (saves ~80 MB)
+        value: "0"                # renderer merged: JS spike kills whole browser — keep separate
       - key: RATE_POST_PER_MIN
         value: "20"
       - key: RATE_GET_PER_MIN
