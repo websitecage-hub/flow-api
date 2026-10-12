@@ -300,6 +300,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(p.query)
         wait = (qs.get("wait", ["0"])[0] == "1")
         if p.path == "/generate":
+            # ONE-GENERATION-AT-A-TIME GUARD: overlapping generates stack
+            # page loads inside the single chrome (each ~110MB of Angular
+            # hydration) and snowball the container past 512MB. Return 429
+            # with Retry-After so clients poll/back off instead.
+            try:
+                if api.is_busy():
+                    self._send(429, {"ok": False,
+                                     "error": "a generation is already running",
+                                     "retry_after_s": 30},
+                               headers={"Retry-After": "30"})
+                    return
+            except Exception:
+                pass
             prompt = (j.get("prompt") or "").strip()
             if not prompt:
                 self._send(400, {"ok": False, "error": "prompt required"})
