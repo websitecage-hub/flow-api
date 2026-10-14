@@ -568,7 +568,6 @@ class FlowAPI:
             "rss_total_mb": rss,
             "rss_python_mb": rss_py,
             "rss_chrome_mb": round(max(rss - rss_py, 0), 1),
-            "js_heap_mb": js_heap,
             "stacks_est": round(max(rss, 1) / 320.0, 1),  # ~320MB per full stack
             "rss_mb": rss,          # backward compat
             "mem_guard_mb": MEM_GUARD_MB,
