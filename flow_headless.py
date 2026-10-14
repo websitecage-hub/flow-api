@@ -67,9 +67,9 @@ STATE_FILE = ROOT / "sessions" / "flow_api_state.json"
 COOKIES_FILE = ROOT / "sessions" / "flow.cookies.full.json"
 MEM_GUARD_MB = int(os.environ.get("FLOW_MEM_GUARD_MB", "420"))
 
-# V8 old-space cap for the renderer. MEM-SPEC: 96 MB — tight but sufficient
-# now that images/media/fonts are blocked (the Angular app's heap churn was
-# mostly decode buffers, not JS objects). Env knob FLOW_JS_HEAP_MB overrides.
+# V8 old-space cap for the renderer. 96 MB: the renderer was measured at
+# 221MB RSS on the Flow app; a tighter heap forces more frequent GC and
+# trims it. Env knob FLOW_JS_HEAP_MB overrides.
 JS_HEAP_MB = int(os.environ.get("FLOW_JS_HEAP_MB", "96"))
 
 # How long to wait for the Flow composer to hydrate before generating.
@@ -497,7 +497,13 @@ class HeadlessEngine:
         args = [
             "--no-sandbox", "--disable-setuid-sandbox",
             "--disable-dev-shm-usage", "--disable-gpu",
-            "--disable-software-rasterizer",
+            "--disable-software-rasterizer", "--disable-gpu-compositing",
+            # MEM (measured on Render): a full chrome stack on the Flow app =
+            # renderer 221 + browser 103 + utility 85 + gpu 84 + zygote 78
+            # = 571MB. --in-process-gpu folds the 84MB GPU process in;
+            # --no-zygote drops the 78MB pair; --single-process merges the
+            # rest (renderer+browser+utility) — the only way under 512MB.
+            "--in-process-gpu", "--no-zygote",
             # reCAPTCHA Enterprise flags navigator.webdriver / automation;
             # this removes it. Verified: generation passes with it.
             "--disable-blink-features=AutomationControlled",
