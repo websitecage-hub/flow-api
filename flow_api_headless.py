@@ -557,20 +557,9 @@ class FlowAPI:
                 rss = round(rss_mb_of(str(PROFILE)), 1)
             except Exception:
                 pass
-        # chrome's own JS heap (via CDP) — distinguishes 'chrome fat' from
-        # 'too many stacks' when rss_total is huge
-        js_heap = 0
-        try:
-            if self.engine is not None and self.engine.page is not None:
-                m = self.engine.page.context.new_cdp_session(
-                    self.engine.page).send(
-                    "Performance.getMetrics")
-                for mm in m.get("metrics", []):
-                    if mm["name"] == "JSHeapUsedSize":
-                        js_heap = round(mm["value"] / 1048576, 1)
-                        break
-        except Exception:
-            pass
+        # NOTE: no CDP calls here — Playwright sync API is thread-bound to
+        # the worker; calling it from the HTTP thread poisons the engine
+        # (greenlet 'cannot switch to a different thread').
         return {
             "ok": True,
             "engine_alive": self.engine is not None,
