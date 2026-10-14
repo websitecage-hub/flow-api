@@ -19,6 +19,7 @@ from pathlib import Path
 
 from flow_headless import (HeadlessEngine, detect_headless_shell, load_state,
                            rss_mb_of, total_tree_rss_mb, read_rss_mb,
+                           proc_breakdown,
                            MEM_GUARD_MB, PROFILE, ROOT, SITE_KEY)
 import flow_store as _fs
 import flow_auth as _auth
@@ -513,6 +514,8 @@ class FlowAPI:
                         if time.time() - last_leak_rebuild > 600:
                             print(f"[mem] RSS {mb:.0f} MB > guard "
                                   f"{MEM_GUARD_MB} MB — hard rebuild", flush=True)
+                            # breakdown so the next run is diagnosable
+                            print(f"[mem] breakdown: {proc_breakdown()}", flush=True)
                             last_leak_rebuild = time.time()
                             self.hard_rebuild(boot=True)
                             import gc

@@ -250,6 +250,43 @@ def total_tree_rss_mb() -> float:
     return total
 
 
+def proc_breakdown() -> str:
+    """Per-kind process count + RSS sum, for diagnosing what makes the
+    container fat (chrome children vs node drivers vs python)."""
+    kinds = {}
+    for p in glob.glob("/proc/[0-9]*"):
+        try:
+            cmd = open(p + "/cmdline", "rb").read().replace(
+                b"\0", b" ").decode("utf-8", "replace")
+            low = cmd.lower()
+            if "chrome" in low or "headless" in low:
+                kind = "chrome"
+                # child type helps spot renderer bloat
+                for tok in cmd.split():
+                    if tok.startswith("--type="):
+                        kind = "chrome:" + tok[7:][:9]
+                        break
+                if kind == "chrome":
+                    kind = "chrome:browser"
+            elif "node" in low and "playwright" in low:
+                kind = "node-driver"
+            elif "flow_server.py" in cmd or "python" in low:
+                kind = "python"
+            else:
+                continue
+            rss = 0
+            for line in open(p + "/status"):
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) // 1024
+                    break
+            c, t = kinds.get(kind, (0, 0))
+            kinds[kind] = (c + 1, t + rss)
+        except Exception:
+            pass
+    return " | ".join(f"{k} x{c}={t}MB" for k, (c, t) in
+                      sorted(kinds.items(), key=lambda kv: -kv[1][1]))
+
+
 def load_state() -> dict:
     st = {}
     if STATE_FILE.exists():
