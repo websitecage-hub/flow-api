@@ -519,17 +519,26 @@ class HeadlessEngine:
             "--no-first-run", "--no-default-browser-check", "--mute-audio",
             # site-per-process off: no renderer per origin; BackForwardCache
             # off: no bfcache page duplicates; Translate/MediaRouter/etc off.
+            # AudioServiceOutOfProcess off: folds the audio service utility
+            # process into the browser (~80MB of the utility RSS).
             "--disable-features=Translate,BackForwardCache,AcceptCHFrame,"
             "MediaRouter,OptimizationHints,"
             "ProcessPerSiteUpToMainFrameThreshold,IsolateOrigins,"
-            "site-per-process,"
+            "site-per-process,AudioServiceOutOfProcess,"
+            "GlobalMediaControls,PictureInPicture,"
+            "SpareRendererForSitePerProcess,"
             # AUTH-CRITICAL: launch UNBOUND so the session's PSIDTS pair
             # accepts server-side rotation (flow_auth.rotate_psidts).
             # Bound sessions 401 RotateCookies from datacenter IPs.
             "EnableBoundSessionCredentials,DeviceBoundSessions",
             f"--js-flags=--max-old-space-size={JS_HEAP_MB}",
             "--renderer-process-limit=1",
+            # force everything into as few processes as this build allows
+            "--in-process-gpu", "--no-zygote", "--disable-gpu-compositing",
         ]
+        # NOTE: --single-process is a no-op in this chrome-headless-shell
+        # build (renderer/browser/utility stay separate) — kept behind the
+        # env flag only for builds that honour it.
         if os.environ.get("FLOW_SINGLE_PROCESS", "1") != "0":
             args.append("--single-process")
         self.ctx = self.pw.chromium.launch_persistent_context(
