@@ -316,12 +316,49 @@ JS_MINT = """(site) => new Promise((resolve) => {
       window.grecaptcha.enterprise.execute(site, {action: 'GENERATE'})
         .then(t => fin({ok: true, token: t}))
         .catch(e => fin({ok: false, err: String(e).slice(0, 300)})));
+  // Flow enforces Trusted Types (require-trusted-types-for 'script'), so a
+  // bare `s.src = url` throws:
+  //   TypeError: Failed to set the 'src' property on 'HTMLScriptElement':
+  //   This document requires 'TrustedScriptURL' assignment.
+  // Build a TrustedScriptURL from a policy (cached on window; createPolicy
+  // throws if the same name is created twice).
+  const ttURL = (u) => {
+    try {
+      if (window.trustedTypes && window.trustedTypes.createPolicy) {
+        if (!window.__flowTTPolicy) {
+          window.__flowTTPolicy = window.trustedTypes.createPolicy(
+            'flowMintPolicy', {createScriptURL: (x) => x});
+        }
+        return window.__flowTTPolicy.createScriptURL(u);
+      }
+    } catch (e) { /* fall through to the raw URL */ }
+    return u;
+  };
+  const inject = () => {
+    try {
+      const s = document.createElement('script');
+      s.src = ttURL('https://www.google.com/recaptcha/enterprise.js?render=' + site);
+      s.onload = go;
+      s.onerror = () => fin({ok: false, err: 'script_error'});
+      document.head.appendChild(s);
+    } catch (e) {
+      fin({ok: false, err: 'inject_failed: ' + String(e).slice(0, 200)});
+    }
+  };
   if (window.grecaptcha && window.grecaptcha.enterprise) return go();
-  const s = document.createElement('script');
-  s.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + site;
-  s.onload = go;
-  s.onerror = () => fin({ok: false, err: 'script_error'});
-  document.head.appendChild(s);
+  // Prefer the app's own loader: Flow usually brings grecaptcha in itself, so
+  // wait for it before injecting our own copy.
+  let waited = 0;
+  const wait = setInterval(() => {
+    waited += 500;
+    if (window.grecaptcha && window.grecaptcha.enterprise) {
+      clearInterval(wait);
+      go();
+    } else if (waited >= 15000) {
+      clearInterval(wait);
+      inject();
+    }
+  }, 500);
   setTimeout(() => fin({ok: false, err: 'mint_timeout'}), 45000);
 })"""
 
