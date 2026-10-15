@@ -498,11 +498,10 @@ class HeadlessEngine:
             "--no-sandbox", "--disable-setuid-sandbox",
             "--disable-dev-shm-usage", "--disable-gpu",
             "--disable-software-rasterizer", "--disable-gpu-compositing",
-            # MEM (measured on Render): a full chrome stack on the Flow app =
-            # renderer 221 + browser 103 + utility 85 + gpu 84 + zygote 78
-            # = 571MB. --in-process-gpu folds the 84MB GPU process in;
-            # --no-zygote drops the 78MB pair; --single-process merges the
-            # rest (renderer+browser+utility) — the only way under 512MB.
+            # MEM (measured on Render): a chrome stack on the Flow app =
+            # renderer 211 + browser 143 + utility 87; plus zygotes 78 + gpu 84
+            # before these flags. --in-process-gpu and --no-zygote remove the
+            # gpu/zygote processes (−162MB measured).
             "--in-process-gpu", "--no-zygote",
             # reCAPTCHA Enterprise flags navigator.webdriver / automation;
             # this removes it. Verified: generation passes with it.
@@ -518,9 +517,8 @@ class HeadlessEngine:
             "--metrics-recording-only",
             "--no-first-run", "--no-default-browser-check", "--mute-audio",
             # site-per-process off: no renderer per origin; BackForwardCache
-            # off: no bfcache page duplicates; Translate/MediaRouter/etc off.
-            # AudioServiceOutOfProcess off: folds the audio service utility
-            # process into the browser (~80MB of the utility RSS).
+            # off: no bfcache duplicates; audio/media services folded in;
+            # spare renderer suppressed.
             "--disable-features=Translate,BackForwardCache,AcceptCHFrame,"
             "MediaRouter,OptimizationHints,"
             "ProcessPerSiteUpToMainFrameThreshold,IsolateOrigins,"
@@ -533,8 +531,6 @@ class HeadlessEngine:
             "EnableBoundSessionCredentials,DeviceBoundSessions",
             f"--js-flags=--max-old-space-size={JS_HEAP_MB}",
             "--renderer-process-limit=1",
-            # force everything into as few processes as this build allows
-            "--in-process-gpu", "--no-zygote", "--disable-gpu-compositing",
         ]
         # NOTE: --single-process is a no-op in this chrome-headless-shell
         # build (renderer/browser/utility stay separate) — kept behind the

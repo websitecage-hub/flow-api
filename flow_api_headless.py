@@ -510,10 +510,17 @@ class FlowAPI:
                 # ── MEM-SPEC watchdog: total tree RSS guard ──
                 try:
                     mb = total_tree_rss_mb()
-                    if mb > MEM_GUARD_MB and not self.is_busy():
-                        if time.time() - last_leak_rebuild > 600:
+                    hard_danger = mb > max(MEM_GUARD_MB + 240, 640)
+                    if (mb > MEM_GUARD_MB and not self.is_busy()) or hard_danger:
+                        # Danger threshold: Render's kernel OOM-kills the
+                        # whole container at 512MB. Dying mid-job loses the
+                        # job anyway — so past a hard wall, rebuild even
+                        # while busy instead of waiting for the kill.
+                        if (time.time() - last_leak_rebuild > 600) or hard_danger:
                             print(f"[mem] RSS {mb:.0f} MB > guard "
-                                  f"{MEM_GUARD_MB} MB — hard rebuild", flush=True)
+                                  f"{MEM_GUARD_MB} MB — hard rebuild"
+                                  f"{' (danger, busy)' if hard_danger else ''}",
+                                  flush=True)
                             # breakdown so the next run is diagnosable
                             print(f"[mem] breakdown: {proc_breakdown()}", flush=True)
                             last_leak_rebuild = time.time()
