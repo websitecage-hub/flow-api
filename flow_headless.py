@@ -687,7 +687,16 @@ class HeadlessEngine:
         redirects to /about). The profile keeps the rotated cookies, so after
         the first seed we leave it alone. Set FLOW_FORCE_COOKIES=1 to override.
         """
-        seed_marker = PROFILE / ".cookies_seeded"
+        # The marker MUST live outside the profile: PROFILE can be baked into
+        # the image (FLOW_PROFILE=/app/profile-copy), so a marker written there
+        # survives a deploy while the *cookies* it refers to do not. The next
+        # boot then believed it was already seeded and started Chrome with a
+        # cookie-less profile -> the app redirected to /about and every RPC
+        # returned 401. /tmp is per-container: it persists across supervisor
+        # engine rebuilds (so we keep freshly rotated PSIDTS) but resets on
+        # every deploy (so we re-seed from the new mint).
+        seed_marker = Path(os.environ.get("FLOW_SEED_MARKER",
+                                          "/tmp/.flow_cookies_seeded"))
         raw = os.environ.get("FLOW_COOKIES_JSON", "").strip()
         if not raw and COOKIES_FILE.exists():
             # fall back to the on-disk export (import_cookies.py output) so a
