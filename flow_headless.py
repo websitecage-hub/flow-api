@@ -312,16 +312,25 @@ def save_state(st: dict):
 # ────────────────────────────────────────────────────────────────
 JS_MINT = """(site) => new Promise((resolve) => {
   const fin = (o) => resolve(o);
-  const go = () => window.grecaptcha.enterprise.ready(() =>
-      window.grecaptcha.enterprise.execute(site, {action: 'GENERATE'})
+  const exec = (g) => {
+    try {
+      g.ready(() => g.execute(site, {action: 'GENERATE'})
         .then(t => fin({ok: true, token: t}))
-        .catch(e => fin({ok: false, err: String(e).slice(0, 300)})));
+        .catch(e => fin({ok: false, err: 'execute: ' + String(e).slice(0, 200)})));
+    } catch (e) {
+      fin({ok: false, err: 'ready: ' + String(e).slice(0, 200)});
+    }
+  };
+  const go = () => {
+    const g = (window.grecaptcha && window.grecaptcha.enterprise)
+      || window.grecaptcha;
+    if (g) return exec(g);
+    return fin({ok: false, err: 'no_grecaptcha'});
+  };
   // Flow enforces Trusted Types (require-trusted-types-for 'script'), so a
   // bare `s.src = url` throws:
   //   TypeError: Failed to set the 'src' property on 'HTMLScriptElement':
   //   This document requires 'TrustedScriptURL' assignment.
-  // Build a TrustedScriptURL from a policy (cached on window; createPolicy
-  // throws if the same name is created twice).
   const ttURL = (u) => {
     try {
       if (window.trustedTypes && window.trustedTypes.createPolicy) {
@@ -334,32 +343,43 @@ JS_MINT = """(site) => new Promise((resolve) => {
     } catch (e) { /* fall through to the raw URL */ }
     return u;
   };
+  const urls = [
+    'https://www.google.com/recaptcha/enterprise.js?render=' + site,
+    'https://www.google.com/recaptcha/api.js?render=' + site,
+  ];
+  let ui = 0;
   const inject = () => {
+    if (ui >= urls.length) return fin({ok: false, err: 'script_error (all loaders)'});
+    const url = urls[ui++];
     try {
       const s = document.createElement('script');
-      s.src = ttURL('https://www.google.com/recaptcha/enterprise.js?render=' + site);
+      s.src = ttURL(url);
       s.onload = go;
-      s.onerror = () => fin({ok: false, err: 'script_error'});
+      // the CSP/network refused this loader — try the next one
+      s.onerror = () => inject();
       document.head.appendChild(s);
     } catch (e) {
       fin({ok: false, err: 'inject_failed: ' + String(e).slice(0, 200)});
     }
   };
-  if (window.grecaptcha && window.grecaptcha.enterprise) return go();
-  // Prefer the app's own loader: Flow usually brings grecaptcha in itself, so
-  // wait for it before injecting our own copy.
+  if ((window.grecaptcha && window.grecaptcha.enterprise) || window.grecaptcha) {
+    return go();
+  }
+  // Prefer the app's own loader: Flow brings grecaptcha in itself, so wait for
+  // it before injecting our own copy. On a 0.1-CPU container the app can take
+  // a long while to boot, hence the generous window.
   let waited = 0;
   const wait = setInterval(() => {
     waited += 500;
-    if (window.grecaptcha && window.grecaptcha.enterprise) {
+    if ((window.grecaptcha && window.grecaptcha.enterprise) || window.grecaptcha) {
       clearInterval(wait);
       go();
-    } else if (waited >= 15000) {
+    } else if (waited >= 40000) {
       clearInterval(wait);
       inject();
     }
   }, 500);
-  setTimeout(() => fin({ok: false, err: 'mint_timeout'}), 45000);
+  setTimeout(() => fin({ok: false, err: 'mint_timeout'}), 90000);
 })"""
 
 JS_RPC = """async ({rpcid, payload, at, pid, base}) => {
@@ -935,7 +955,7 @@ class HeadlessEngine:
     def mint(self, action: str = "GENERATE") -> str:
         """Fresh reCAPTCHA Enterprise token for `action` (single-use)."""
         r = self.page.evaluate(JS_MINT.replace("'GENERATE'", json.dumps(action)),
-                               SITE_KEY)
+                               SITE_KEY, timeout=120)
         if not (r or {}).get("ok"):
             self.last_error = f"mint failed: {(r or {}).get('err')}"
             _log(f"[!] {self.last_error}")
