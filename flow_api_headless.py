@@ -98,20 +98,37 @@ class _AuthState:
         master = os.environ.get("FLOW_MASTER_TOKEN", "").strip()
         email = (os.environ.get("FLOW_ACCOUNT_EMAIL", "")
                  or os.environ.get("FLOW_EMAIL", "")).strip()
-        # OOM GUARD: skip mint if an on-disk jar already exists — a fresh mint
-        # + browser boot together spike past 512 MB on Render free. The disk
-        # jar was minted+rotated by a previous boot; reuse it, let the
-        # rotation loop refresh it. Only mint when nothing usable exists.
+        # Previously: "skip the mint if a jar exists on disk" (an OOM guard
+        # from the Playwright era). That guard is obsolete and actively
+        # harmful now:
+        #   * the CDP driver runs ~310MB with ~200MB headroom, and the mint is
+        #     a pure-Python HTTP call (gpsoauth) — it spawns no browser;
+        #   * /app/sessions PERSISTS ACROSS DEPLOYS on Render, so the guard let
+        #     an old jar win over a fresh master mint. PSIDTS rotates ~10min,
+        #     so the service booted "logged out" (rotate=401, credits empty).
+        # Now: mint fresh unless the on-disk jar is recent enough to trust.
         fp = ROOT / "sessions" / "flow.cookies.full.json"
         have_disk_jar = False
+        jar_age_s = None
         if fp.exists():
             try:
                 jar = json.loads(fp.read_text(encoding="utf-8"))
                 if any(c.get("name") == "__Secure-1PSID" for c in jar):
                     have_disk_jar = True
+                    jar_age_s = max(0.0, time.time() - fp.stat().st_mtime)
             except Exception:
                 pass
-        if not self.jar and master and email and not have_disk_jar:
+        try:
+            max_age = float(os.environ.get("FLOW_JAR_MAX_AGE_S", "1200"))
+        except Exception:
+            max_age = 1200.0
+        force_mint = os.environ.get("FLOW_FORCE_MINT", "") == "1"
+        jar_stale = (not have_disk_jar) or jar_age_s is None or \
+                    jar_age_s > max_age
+        if master and email and (jar_stale or force_mint or not self.jar):
+            print(f"[auth] minting fresh jar (disk_jar={have_disk_jar} "
+                  f"age={('%.0fs' % jar_age_s) if jar_age_s is not None else 'n/a'}"
+                  f" force={force_mint})", flush=True)
             try:
                 self.jar = _auth.mint_cookies(
                     email, master, os.environ.get("FLOW_ANDROID_ID",
