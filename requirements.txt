@@ -3,3 +3,5 @@ curl_cffi>=0.5
 pillow>=10.0
 boto3>=1.28  # only needed when S3_* storage env is set (R2/Backblaze/S3)
 gpsoauth>=1.4  # master-token -> cookie-jar mint (flow_auth.Breakthrough C)
+
+websocket-client>=1.7  # pure-Python CDP transport (flow_cdp.py)

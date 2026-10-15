@@ -1,11 +1,12 @@
 # Slim runtime deps for the Render image (browser comes from Playwright's
 # install, not from Python wheels). boto3/pillow stay local-dev only
 # (requirements.txt); server imports them lazily / not at all.
+#
+# NOTE: playwright is installed ONLY to fetch the chrome-headless-shell
+# binary and its system libraries (playwright install --with-deps
+# chromium-headless-shell). The engine itself drives Chrome over raw CDP
+# (flow_cdp.py) — no Playwright API, no Node driver process in the runtime.
 playwright>=1.40
 curl_cffi>=0.5
 gpsoauth>=1.4
-
-# NOTE for FLOW_ENGINE=headless: the Dockerfile runs
-#   playwright install --with-deps chromium-headless-shell
-# which pulls the tiny single-process browser (~120 MB RSS) used on free tier.
-# gpsoauth powers flow_auth.mint_cookies() (master token -> full cookie jar).
+websocket-client>=1.7   # pure-Python CDP transport (replaces the Node driver)

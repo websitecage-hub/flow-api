@@ -489,8 +489,16 @@ class HeadlessEngine:
         used = rss_mb_of(str(PROFILE))
         if used > MEM_GUARD_MB:
             _log(f"[!] RSS already {used:.0f} MB > guard {MEM_GUARD_MB} MB")
-        from playwright.sync_api import sync_playwright
-        self.pw = sync_playwright().start()
+        # DRIVER: pure-Python CDP (flow_cdp) — no Playwright, no Node process.
+        # The playwright node driver held ~117MB RSS, which alone was the gap
+        # between 620MB and the 512MB free-tier limit. FLOW_CDP=0 falls back
+        # to Playwright for comparison/debugging.
+        if os.environ.get("FLOW_CDP", "1") != "0":
+            import flow_cdp
+            self.pw = flow_cdp.sync_playwright().start()
+        else:
+            from playwright.sync_api import sync_playwright
+            self.pw = sync_playwright().start()
         # MEM-SPEC launch args (512MB free tier): cap V8 heap, merge renderer
         # into the browser process, prevent per-origin renderer spawning.
         # FLOW_SINGLE_PROCESS=0 drops --single-process (fallback if it hangs).
