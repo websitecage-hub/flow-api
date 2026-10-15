@@ -1283,7 +1283,7 @@ class HeadlessEngine:
                      .map(T).filter(Boolean).slice(0,60)
           }));
           // model names anywhere in the DOM text
-          const body = document.body ? document.body.innerText : '';
+          const body = document.body ? (document.body.textContent || document.body.innerText || '') : '';
           out.modelMentions = (body.match(/Nano Banana[^\n]{0,30}/gi) || [])
                                 .map(s=>s.trim()).filter((v,i,a)=>a.indexOf(v)===i);
           out.aspectMentions = (body.match(/\b\d{1,2}:\d{1,2}\b/g) || [])
@@ -1308,7 +1308,7 @@ class HeadlessEngine:
                 "() => document.querySelectorAll('[contenteditable=true]').length")
             report["composer_present"] = n
             trig = self.page.evaluate("""() => {
-              const T=(e)=>(e.innerText||'').trim();
+              const T=(e)=>((e.textContent||e.innerText||'')).trim();
               const vis=(e)=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0;};
               const btns=[...document.querySelectorAll('button,[role=button]')]
                 .filter(e=>vis(e) && /Nano Banana|aspect|ratio|16:9|1:1|4K|2K|x[1-4]/i.test(T(e)));
@@ -1318,7 +1318,7 @@ class HeadlessEngine:
             for i in range(min(6, len(trig or []))):
                 try:
                     self.page.evaluate(f"""() => {{
-                      const T=(e)=>(e.innerText||'').trim();
+                      const T=(e)=>((e.textContent||e.innerText||'')).trim();
                       const vis=(e)=>{{const r=e.getBoundingClientRect();return r.width>0&&r.height>0;}};
                       const btns=[...document.querySelectorAll('button,[role=button]')]
                         .filter(e=>vis(e) && /Nano Banana|aspect|ratio|16:9|1:1|4K|2K|x[1-4]/i.test(T(e)));

@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import queue
 import socket
 import subprocess
 import threading
@@ -54,10 +55,15 @@ class _Conn:
         self._handlers: Dict[str, List[Callable]] = {}
         self._hlock = threading.Lock()
         self._closed = False
+        self._events: "queue.Queue" = queue.Queue()
         self._t = threading.Thread(target=self._reader, daemon=True)
         self._t.start()
+        self._d = threading.Thread(target=self._dispatcher, daemon=True)
+        self._d.start()
 
-    # -- reader -------------------------------------------------
+    # -- reader: NEVER runs user handlers (they may send CDP commands, which
+    #    would need this thread to read the reply -> deadlock). It only
+    #    routes id-replies and queues events.
     def _reader(self):
         while not self._closed:
             try:
@@ -81,16 +87,22 @@ class _Conn:
             else:
                 method = msg.get("method")
                 if method:
-                    self._dispatch(method, msg)
+                    self._events.put((method, msg.get("params") or {},
+                                      msg.get("sessionId")))
 
-    def _dispatch(self, method: str, msg: dict):
-        with self._hlock:
-            handlers = list(self._handlers.get(method, ()))
-        for h in handlers:
+    def _dispatcher(self):
+        while not self._closed:
             try:
-                h(msg.get("params") or {}, msg.get("sessionId"))
-            except Exception:
-                pass
+                method, params, sid = self._events.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            with self._hlock:
+                handlers = list(self._handlers.get(method, ()))
+            for h in handlers:
+                try:
+                    h(params, sid)
+                except Exception:
+                    pass
 
     # -- api ----------------------------------------------------
     def on(self, method: str, handler: Callable):
@@ -215,6 +227,23 @@ def _js_escape(s: str) -> str:
     return json.dumps(s)
 
 
+# headers CDP refuses to set via Fetch.continueRequest (attempting them makes
+# the call fail, which would leave the request paused forever)
+_FORBIDDEN = {"host", "content-length", "connection", "transfer-encoding",
+              "keep-alive", "upgrade", "proxy-connection", "proxy-authorization",
+              "te", "trailer"}
+
+
+def _clean_headers(h: dict) -> List[dict]:
+    out = []
+    for k, v in (h or {}).items():
+        lk = str(k).lower()
+        if not lk or lk.startswith(":") or lk in _FORBIDDEN:
+            continue
+        out.append({"name": str(k), "value": str(v)})
+    return out
+
+
 class Locator:
     def __init__(self, page: "Page", selector: str = "", role: str = "",
                  name: str = "", first: bool = False):
@@ -295,6 +324,15 @@ class Locator:
             if box and box.get("w", 0) > 0 and box.get("h", 0) > 0:
                 cx = box["x"] + box["w"] / 2.0
                 cy = box["y"] + box["h"] / 2.0
+                # focus first: the composer only accepts keystrokes when the
+                # element (not just the page) holds focus
+                try:
+                    js = (self._find_js() + "[0]") if self._role else \
+                         f"document.querySelector({_js_escape(self._sel)})"
+                    self._page.evaluate(f"(() => {{const e={js};"
+                                        "if(e && e.focus) e.focus(); return true;})()")
+                except Exception:
+                    pass
                 self._page.mouse_click(cx, cy)
                 return True
             time.sleep(0.4)
@@ -365,21 +403,27 @@ class Keyboard:
                            session_id=self._p._sid, wait=False)
 
     def type(self, text: str, delay: float = 15):
-        """Insert text as the user would: Input.insertText fires the input
-        events Angular needs, in one round-trip (fast on 0.1 CPU)."""
+        """Type like a human: per-character keyDown(with text)+keyUp, which
+        fires keydown/keypress/input/keyup — what Angular's composer needs.
+        Input.insertText is faster but silently no-ops on some focused
+        contenteditables, so key events are the reliable path."""
         if not text:
             return
-        try:
-            self._p._conn.send("Input.insertText", {"text": text},
+        for ch in text:
+            vk = ord(ch.upper()) if ch.isalpha() else ord(ch)
+            code = f"Key{ch.upper()}" if ch.isalpha() else (
+                f"Digit{ch}" if ch.isdigit() else ch)
+            common = {"key": ch, "code": code,
+                      "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+            self._p._conn.send("Input.dispatchKeyEvent",
+                               {**common, "type": "keyDown", "text": ch,
+                                "unmodifiedText": ch},
                                session_id=self._p._sid, timeout=20)
-        except Exception:
-            for ch in text:
-                self._p._conn.send(
-                    "Input.dispatchKeyEvent",
-                    {"type": "char", "text": ch, "key": ch},
-                    session_id=self._p._sid, wait=False)
-                if delay:
-                    time.sleep(min(delay, 25) / 1000.0)
+            self._p._conn.send("Input.dispatchKeyEvent",
+                               {**common, "type": "keyUp"},
+                               session_id=self._p._sid, wait=False)
+            if delay:
+                time.sleep(min(delay, 25) / 1000.0)
 
 
 class Page:
@@ -496,9 +540,11 @@ class Page:
     def mouse_click(self, x: float, y: float):
         base = {"x": x, "y": y, "button": "left", "clickCount": 1}
         self._send_async("Input.dispatchMouseEvent",
-                         {**base, "type": "mousePressed"})
+                         {**base, "type": "mouseMoved", "buttons": 0})
         self._send_async("Input.dispatchMouseEvent",
-                         {**base, "type": "mouseReleased"})
+                         {**base, "type": "mousePressed", "buttons": 1})
+        self._send_async("Input.dispatchMouseEvent",
+                         {**base, "type": "mouseReleased", "buttons": 0})
 
     # -- events ------------------------------------------------
     def on(self, event: str, handler: Callable):
@@ -570,6 +616,8 @@ class Context:
         self._init_scripts: List[str] = []
         self._routes: List[Callable] = []
         self._fetch_on = False
+        self._paused_ids: Dict[str, float] = {}
+        self._closed = False
         self.page = Page(self._conn, self._sid)
 
     # -- pages -------------------------------------------------
@@ -622,14 +670,16 @@ class Context:
                     pass
                 if chain.abort:
                     break
+            # a request left paused forever hangs the page — track it so the
+            # sweeper can release it if our continue silently failed
+            self._paused_ids[rid] = time.time()
             try:
                 if chain.abort:
                     self.page._send_async("Fetch.failRequest",
                                           {"requestId": rid,
                                            "errorReason": "Aborted"})
                 elif chain.headers:
-                    hdrs = [{"name": str(k), "value": str(v)}
-                            for k, v in chain.headers.items()]
+                    hdrs = _clean_headers(chain.headers)
                     self.page._send_async("Fetch.continueRequest",
                                           {"requestId": rid, "headers": hdrs})
                 else:
@@ -639,6 +689,20 @@ class Context:
                 pass
 
         self._conn.on("Fetch.requestPaused", _paused)
+        # sweeper: release anything paused > 25s (silent-failure safety net)
+        def _sweep():
+            while not self._closed:
+                time.sleep(5)
+                now = time.time()
+                for rid, ts in list(self._paused_ids.items()):
+                    if now - ts > 25:
+                        self._paused_ids.pop(rid, None)
+                        try:
+                            self.page._send_async("Fetch.continueRequest",
+                                                  {"requestId": rid})
+                        except Exception:
+                            pass
+        threading.Thread(target=_sweep, daemon=True).start()
 
     # -- cookies -----------------------------------------------
     def add_cookies(self, cookies: List[dict]):
@@ -754,6 +818,19 @@ class Browser:
                 self._conn.send(m, {}, session_id=self._sid, timeout=20)
             except Exception:
                 pass
+        # INPUT-CRITICAL: a headless page reports "not focused", so Chrome
+        # silently DROPS dispatched key events (typing appeared to no-op).
+        # Focus emulation makes the renderer believe it has focus.
+        try:
+            self._conn.send("Emulation.setFocusEmulationEnabled",
+                            {"enabled": True}, session_id=self._sid, timeout=20)
+        except Exception:
+            pass
+        try:
+            self._conn.send("Page.bringToFront", {}, session_id=self._sid,
+                            timeout=20)
+        except Exception:
+            pass
         return self
 
     def _args_full(self, port: int) -> List[str]:
