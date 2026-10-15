@@ -165,22 +165,47 @@ _XSRF_RE = re.compile(r'"xsrf","([^"]+)"')
 
 
 def harvest_at(session: "cffi.Session", bl: str, fsid: str) -> str:
-    """Send an RPC without `at`; parse the disclosed token from the 400 body."""
+    """Obtain the batchexecute XSRF (`at`) token.
+
+    Two sources, in order:
+      1. the 400-body disclosure — send an RPC without `at` and read the
+         token Google helpfully echoes back (fast, but only when the session
+         is in a state that triggers the disclosure; a plain `er` 400 body
+         carries no xsrf, which used to fail the harvest outright);
+      2. the Flow page itself — Google apps embed the same token in
+         window.WIZ_global_data.SNlM0e (identical value, works whenever the
+         session is valid).
+    """
     url = (FLOW_ORIGIN + BE_PATH +
            "?rpcids=o30O0e&source-path=%2F"
            f"&bl={bl}&f.sid={fsid}&rt=c")
     body = 'f.req=' + _freq([["o30O0e", "[]", None, "generic"]])
-    r = session.post(
-        url, data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                 "X-Same-Domain": "1", "User-Agent": UA,
-                 "Origin": FLOW_ORIGIN, "Referer": FLOW_ORIGIN + "/"},
-        timeout=60,
-    )
-    m = _XSRF_RE.search(r.text)
-    if not m:
-        raise RuntimeError(f"no xsrf in {r.status_code} body: {r.text[:200]}")
-    return m.group(1)
+    notice = ""
+    try:
+        r = session.post(
+            url, data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                     "X-Same-Domain": "1", "User-Agent": UA,
+                     "Origin": FLOW_ORIGIN, "Referer": FLOW_ORIGIN + "/"},
+            timeout=60,
+        )
+        m = _XSRF_RE.search(r.text)
+        if m:
+            return m.group(1)
+        notice = f"400-body route gave no xsrf (status {r.status_code})"
+    except Exception as e:
+        notice = f"400-body route errored: {str(e)[:80]}"
+
+    # fallback: the token embedded in the app page
+    try:
+        r2 = session.get(FLOW_ORIGIN + "/", headers={"User-Agent": UA},
+                         timeout=60)
+        m2 = re.search(r'"SNlM0e":"([^"]+)"', r2.text)
+        if m2:
+            return m2.group(1)
+    except Exception as e:
+        notice += f"; page fetch errored: {str(e)[:80]}"
+    raise RuntimeError(f"at unavailable — {notice}")
 
 
 def extract_wiz(session: "cffi.Session") -> tuple[str, str]:
