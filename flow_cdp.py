@@ -431,6 +431,8 @@ class Page:
         self._conn = conn
         self._sid = sid
         self.keyboard = Keyboard(self)
+        self._seen_errors = set()
+        self._last_js_error = ""
 
     # -- helpers ------------------------------------------------
     def _send(self, method, params=None, timeout=30, wait=True):
@@ -489,7 +491,19 @@ class Page:
             return None
         res = r.get("result", {})
         if r.get("exceptionDetails"):
-            # surface as None: callers treat falsy as "not ready yet"
+            # Surface the JS error instead of silently returning None —
+            # a bare None made "create_project failed" undiagnosable.
+            try:
+                ex = r["exceptionDetails"]
+                desc = (ex.get("exception") or {}).get("description") or \
+                       ex.get("text") or "?"
+                self._last_js_error = str(desc)[:300]
+                if self._last_js_error not in self._seen_errors:
+                    self._seen_errors.add(self._last_js_error)
+                    print(f"[cdp] JS error: {self._last_js_error} | expr: "
+                          f"{str(expression)[:120]!r}", flush=True)
+            except Exception:
+                pass
             return None
         if "value" in res:
             return res["value"]
