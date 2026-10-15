@@ -530,14 +530,19 @@ class FlowAPI:
                             continue
                 except Exception:
                     pass
+                # ENGINE-MISSING takes priority over busy: a queued job with
+                # no engine can never complete, so waiting on is_busy() here
+                # deadlocked the service (busy=True forever, engine_alive
+                # False, 429 guard rejecting everything).
+                if self.engine is None or self.boot_error:
+                    if time.time() - boot_ts > 60:
+                        print("[supervisor] engine missing -> rebuild", flush=True)
+                        self.hard_rebuild(boot=True)
+                        continue
                 if self.is_busy():
                     continue
                 # give the boot engine time to settle before any rebuild
                 if time.time() - boot_ts < 150:
-                    continue
-                if self.engine is None or self.boot_error:
-                    print("[supervisor] engine missing -> rebuild", flush=True)
-                    self.hard_rebuild(boot=True)
                     continue
                 # cheap liveness probe (refreshes last_engine_ok)
                 try:
