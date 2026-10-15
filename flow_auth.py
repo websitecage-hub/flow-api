@@ -33,8 +33,11 @@ import re
 import time
 import json
 import threading
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote as _quote, quote
+
+ROOT = Path(__file__).resolve().parent
 
 try:
     from curl_cffi import requests as cffi
@@ -114,8 +117,38 @@ def mint_cookies(email: str, master_token: str, android_id: str = "0123456789abc
     r.raise_for_status()
 
     jar = {}
+    # Google sets per-domain duplicates of the same name (e.g. SID/APISID on
+    # .google.com AND .youtube.com). A plain {name: value} dict collapses them,
+    # and whichever is iterated last wins — if a non-google.com duplicate wins,
+    # every later request is UNAUTHENTICATED even though the mint "succeeded".
+    # Rule: google.com-scoped values always win; other domains only fill gaps.
     for c in s.cookies.jar:
-        jar[c.name] = c.value
+        dom = (getattr(c, "domain", "") or "").lower()
+        is_google = "google.com" in dom
+        if is_google or c.name not in jar:
+            jar[c.name] = c.value
+    # FULL RECORDS: the dict above is lossy. Restoring a session from it (all
+    # cookies forced to .google.com, without per-cookie `Secure`) is NOT
+    # equivalent — __Secure-*/__Host-* cookies require Secure, and domain
+    # scope matters. Rebuilding from the dict silently logs the session out,
+    # which is what made the `at` harvest fail. Keep the faithful records.
+    try:
+        records = [{"name": c.name, "value": c.value,
+                    "domain": getattr(c, "domain", "") or ".google.com",
+                    "path": getattr(c, "path", "/") or "/",
+                    "secure": bool(getattr(c, "secure", False)),
+                    "httpOnly": bool(getattr(c, "httpOnly", False)),
+                    "expires": getattr(c, "expires", None)}
+                   for c in s.cookies.jar]
+        global LAST_RECORDS
+        LAST_RECORDS = records
+        try:
+            _RECORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _RECORDS_FILE.write_text(json.dumps(records), encoding="utf-8")
+        except Exception:
+            pass
+    except Exception:
+        pass
     need = ("SID", "HSID", "SSID", "SAPISID", "__Secure-1PSID", "__Secure-3PSID")
     missing = [n for n in need if n not in jar]
     if missing:
@@ -162,6 +195,50 @@ def rotate_psidts(jar: dict, session: Optional["cffi.Session"] = None):
 # Breakthrough B — harvest the `at` token (Google discloses it)
 # ─────────────────────────────────────────────────────────────────
 _XSRF_RE = re.compile(r'"xsrf","([^"]+)"')
+
+# Full-fidelity cookie records from the last mint (see mint_cookies). The
+# name→value dict is lossy: restoring a session from it drops per-cookie
+# domain scope and `Secure`, which silently de-authenticates __Secure-* cookies.
+LAST_RECORDS: list = []
+_RECORDS_FILE = ROOT / "sessions" / "flow.cookies.records.json"
+
+
+def load_records() -> list:
+    """Cookie records: in-memory mint output, else the on-disk copy."""
+    if LAST_RECORDS:
+        return LAST_RECORDS
+    try:
+        return json.loads(_RECORDS_FILE.read_text(encoding="utf-8")) or []
+    except Exception:
+        return []
+
+
+def restore_session(records=None, jar: Optional[dict] = None):
+    """Build an HTTP session with FAITHFUL cookies (domain + Secure preserved).
+
+    Prefers full records; falls back to the lossy dict with Secure set for the
+    __Secure-*/__Host-* names (which Chrome/Google require).
+    """
+    s = _session()
+    recs = records if records is not None else load_records()
+    if recs:
+        for c in recs:
+            try:
+                s.cookies.set(c.get("name", ""), c.get("value", ""),
+                              domain=c.get("domain") or ".google.com",
+                              path=c.get("path") or "/",
+                              secure=bool(c.get("secure")))
+            except Exception:
+                pass
+        return s
+    for k, v in (jar or {}).items():
+        try:
+            s.cookies.set(k, v, domain=".google.com", path="/",
+                          secure=k.startswith("__Secure") or
+                          k.startswith("__Host") or k == "SAPISID")
+        except Exception:
+            pass
+    return s
 
 
 def harvest_at(session: "cffi.Session", bl: str, fsid: str) -> str:

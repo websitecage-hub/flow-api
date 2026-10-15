@@ -668,15 +668,6 @@ class HeadlessEngine:
         the first seed we leave it alone. Set FLOW_FORCE_COOKIES=1 to override.
         """
         seed_marker = PROFILE / ".cookies_seeded"
-        if (seed_marker.exists() and not os.environ.get("FLOW_FORCE_COOKIES")
-                and not getattr(self, "_force_reseed", False)):
-            _log("[*] profile already seeded; keeping rotated session cookies")
-            try:
-                self.page.reload(timeout=45000, wait_until="commit")
-                self._pump(seconds=4)
-            except Exception:
-                pass
-            return
         raw = os.environ.get("FLOW_COOKIES_JSON", "").strip()
         if not raw and COOKIES_FILE.exists():
             # fall back to the on-disk export (import_cookies.py output) so a
@@ -686,6 +677,31 @@ class HeadlessEngine:
                 _log(f"[*] cookies from on-disk {COOKIES_FILE.name}")
             except Exception:
                 pass
+        # Fingerprint the jar and re-seed whenever it CHANGES. The marker used
+        # to be a bare timestamp, so a re-minted jar (e.g. right after a
+        # master-token update) was ignored and the browser kept
+        # stale, logged-out cookies — the app then redirected to /about.
+        import hashlib
+        sig = (hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+               if raw else "")
+        prev = ""
+        if seed_marker.exists():
+            try:
+                prev = seed_marker.read_text(encoding="utf-8").strip()
+            except Exception:
+                prev = ""
+        force = bool(os.environ.get("FLOW_FORCE_COOKIES")) or bool(
+            getattr(self, "_force_reseed", False))
+        if prev and prev == sig and not force:
+            _log("[*] profile already seeded with this jar; keeping rotated cookies")
+            try:
+                self.page.reload(timeout=45000, wait_until="commit")
+                self._pump(seconds=4)
+            except Exception:
+                pass
+            return
+        if prev and prev != sig:
+            _log("[*] cookie jar changed -> re-seeding browser profile")
         if not raw:
             return
         import base64
@@ -724,7 +740,7 @@ class HeadlessEngine:
         except Exception:
             pass
         try:
-            seed_marker.write_text(str(time.time()), encoding="utf-8")
+            seed_marker.write_text(sig or str(time.time()), encoding="utf-8")
         except Exception:
             pass
 

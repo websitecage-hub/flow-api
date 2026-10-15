@@ -168,10 +168,19 @@ class _AuthState:
         try:
             fp = ROOT / "sessions" / "flow.cookies.full.json"
             fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(json.dumps(
-                [{"name": k, "value": v, "domain": ".google.com", "path": "/",
-                  "secure": k.startswith("__Secure") or k == "SAPISID"}
-                 for k, v in self.jar.items()]), encoding="utf-8")
+            # Write FULL records (name/value/domain/path/secure) when we have
+            # them: the engine seeds the browser from this file, and flattening
+            # everything to .google.com without per-cookie `Secure` leaves
+            # __Secure-* cookies dropped and the browser logged out.
+            recs = _auth.load_records()
+            if recs:
+                fp.write_text(json.dumps(recs), encoding="utf-8")
+            else:
+                fp.write_text(json.dumps(
+                    [{"name": k, "value": v, "domain": ".google.com", "path": "/",
+                      "secure": (k.startswith("__Secure")
+                                 or k.startswith("__Host") or k == "SAPISID")}
+                     for k, v in self.jar.items()]), encoding="utf-8")
         except Exception:
             pass
         _auth.kv_put(self.jar, {"bl": self.bl, "fsid": self.fsid})
@@ -216,9 +225,7 @@ class _AuthState:
         if not self.jar:
             return ""
         try:
-            s = _auth._session()
-            for k, v in self.jar.items():
-                s.cookies.set(k, v, domain=".google.com")
+            s = _auth.restore_session(jar=self.jar)
             if not (self.bl and self.fsid):
                 self.bl, self.fsid = _auth.extract_wiz(s)
             self.at = _auth.harvest_at(s, self.bl, self.fsid)
