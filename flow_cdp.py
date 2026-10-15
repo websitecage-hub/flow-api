@@ -480,9 +480,14 @@ class Page:
     def evaluate(self, expression: str, arg: Any = None, timeout: float = 60):
         expr = expression
         if arg is not None:
-            # Playwright passes an argument; emulate by wrapping in a call
-            expr = (f"((__a) => (typeof {expression} === 'function' "
-                    f"? ({expression})(__a) : ({expression})))({json.dumps(arg)})")
+            # Playwright-style "call this function with an argument".
+            # Assign to a const first: `typeof async ({a}) => {}` is a
+            # SyntaxError (typeof binds to `async`), which silently broke
+            # every engine RPC. A const assignment parses for arrows, async
+            # arrows and plain expressions alike.
+            expr = ("((__a) => { const __f = (" + expression + ");"
+                    " return (typeof __f === 'function') ? __f(__a) : __f; })"
+                    "(" + json.dumps(arg) + ")")
         r = self._send("Runtime.evaluate",
                        {"expression": expr, "returnByValue": True,
                         "awaitPromise": True, "userGesture": True},
