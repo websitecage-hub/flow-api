@@ -984,11 +984,31 @@ class HeadlessEngine:
         """POST a batchexecute RPC from inside the page. Returns parsed data.
         Uses the app's captured URL/at when available (copy-the-headers)."""
         pid = project_id or load_state().get("project_id", "")
-        at = self._live_at or self.at_token()
-        r = self.page.evaluate(JS_RPC, {
-            "rpcid": rpcid, "payload": payload, "at": at, "pid": pid,
-            "base": self._be_base,
-        })
+        # A stale `at` shows up as HTTP 401 from batchexecute (not 400). The at
+        # lives in page state and goes stale when the app re-inits or the
+        # session rotates; a captured _live_at can outlive its usefulness.
+        # On 401: drop BOTH cached copies, re-scrape from the page, retry once.
+        r = None
+        for attempt in (0, 1):
+            at = (self._live_at or self.at_token(refresh=(attempt == 1)))
+            r = self.page.evaluate(JS_RPC, {
+                "rpcid": rpcid, "payload": payload, "at": at, "pid": pid,
+                "base": self._be_base,
+            })
+            if isinstance(r, dict) and r.get("status") == 200:
+                break
+            if (isinstance(r, dict) and r.get("status") in (401, 403)
+                    and attempt == 0):
+                _log(f"[*] rpc {rpcid}: {r.get('status')} -> refreshing `at` "
+                     f"and retrying")
+                self._live_at = ""
+                self._at = ""
+                try:
+                    self._pump(seconds=1.5)
+                except Exception:
+                    pass
+                continue
+            break
         if not isinstance(r, dict) or r.get("status") != 200:
             _log(f"[!] rpc {rpcid}: {r}")
             return None
