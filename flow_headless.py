@@ -991,6 +991,22 @@ class HeadlessEngine:
         r = None
         for attempt in (0, 1):
             at = (self._live_at or self.at_token(refresh=(attempt == 1)))
+            if not at:
+                # No XSRF token means the page hasn't initialised (or the
+                # session lapsed). Firing anyway returns a confusing 401 and
+                # looks like an auth failure; say what it actually is.
+                if attempt == 0:
+                    self._live_at = ""
+                    self._at = ""
+                    try:
+                        self._pump(seconds=1.5)
+                    except Exception:
+                        pass
+                    continue
+                self.last_error = "no at token"
+                _log(f"[!] rpc {rpcid}: no `at` token (page not initialised "
+                     f"or session lapsed) — not sending")
+                return None
             r = self.page.evaluate(JS_RPC, {
                 "rpcid": rpcid, "payload": payload, "at": at, "pid": pid,
                 "base": self._be_base,

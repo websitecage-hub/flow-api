@@ -277,6 +277,8 @@ class FlowAPI:
         self.last_engine_ok = 0.0        # epoch s of last successful engine op
         self._rebuild_inflight = False   # single-flight guard for rebuilds
         self._rebuild_lock = threading.Lock()
+        self._last_heal = 0.0            # backoff for session re-mints
+        self._heal_requested = ""        # set by a job that hit a dead session
         self.session_ok = None           # cached login state (None = unknown)
         self.last_recover = 0.0          # epoch of last successful self-heal
         self._supervisor = None
@@ -500,11 +502,76 @@ class FlowAPI:
             self.session_ok = ok
             if ok:
                 self.last_recover = time.time()
+                self.last_error = ""          # clear stale scary strings on recovery
             return ok
         except Exception as e:
             self.session_ok = False
             print(f"[supervisor] ensure_session failed: {str(e)[:150]}", flush=True)
             return False
+
+    @staticmethod
+    def _looks_like_dead_session(err) -> bool:
+        """Does this generation error mean the SESSION died (re-mint needed)?
+
+        Distinct from a content/quality failure: only these warrant the
+        rebuild+re-mint recovery path.
+        """
+        low = str(err or "").lower()
+        return any(k in low for k in (
+            "401", "403", "logged out", "no project id", "create_project",
+            "session", "no at token", "cookie", "unauthenticated"))
+
+    def heal_session(self, reason=""):
+        """The ONE recovery path for every logged-out / 401 state.
+
+        Re-seeding the *same* cookies cannot fix a lapsed login — the mint
+        underneath has to be redone. So: re-mint from the master token,
+        persist (which also synces+rewrites the records the browser seeds
+        from, so the engine re-seeds automatically because the file changed),
+        rebuild, then verify by reading the account.
+
+        Backed off so a Google outage cannot become a rebuild loop.
+        """
+        now = time.time()
+        if now - self._last_heal < 120:
+            print(f"[heal] skipped (backoff, {now - self._last_heal:.0f}s since "
+                  f"last attempt)", flush=True)
+            return False
+        self._last_heal = now
+        master = os.environ.get("FLOW_MASTER_TOKEN", "").strip()
+        email = (os.environ.get("FLOW_ACCOUNT_EMAIL", "")
+                 or os.environ.get("FLOW_EMAIL", "")).strip()
+        if master and email:
+            try:
+                jar = _auth.mint_cookies(
+                    email, master,
+                    os.environ.get("FLOW_ANDROID_ID", "0123456789abcdef"))
+                AUTH.set_jar(jar)            # persists synced records to disk
+                AUTH.invalidate_at()
+                print(f"[heal] re-minted from master token "
+                      f"({len(jar)} cookies) reason={reason or 'n/a'}", flush=True)
+            except Exception as e:
+                print(f"[heal] re-mint failed: {str(e)[:160]}", flush=True)
+        else:
+            print("[heal] no master token/email set — cannot re-mint", flush=True)
+        try:
+            self.hard_rebuild(boot=True)
+        except Exception as e:
+            print(f"[heal] rebuild failed: {str(e)[:130]}", flush=True)
+        ok = False
+        try:
+            ok = bool(self.run(lambda: self.engine.credits() is not None,
+                               timeout=240))
+        except Exception as e:
+            print(f"[heal] verify failed: {str(e)[:130]}", flush=True)
+        self.session_ok = ok
+        if ok:
+            self.last_recover = time.time()
+            self.last_error = ""
+            print("[heal] session recovered", flush=True)
+        else:
+            print("[heal] session STILL failing after re-mint", flush=True)
+        return ok
 
     def _start_supervisor(self):
         if self._supervisor and self._supervisor.is_alive():
@@ -522,8 +589,13 @@ class FlowAPI:
         python + chrome RSS > FLOW_MEM_GUARD_MB (400) triggers a hard rebuild
         (fresh browser) instead of letting Render's OOM killer do it randomly."""
         boot_ts = time.time()
-        last_sess = time.time() + 120   # first session check ~2min after boot
+        # first login check ~2 min after boot (last_sess is compared with a
+        # 600s threshold, so back-date it rather than pushing it forward —
+        # the old value delayed the first verification by ~12 minutes)
+        last_sess = time.time() - 480.0
         last_leak_rebuild = 0.0
+        last_rebuild = 0.0
+        liveness_fails = 0
         while True:
             time.sleep(self._supervisor_interval)
             try:
@@ -566,21 +638,45 @@ class FlowAPI:
                         continue
                 if self.is_busy():
                     continue
+                # a job that hit a dead session asked for a re-mint; do it here
+                # (never inline: hard_rebuild re-enters the worker queue)
+                if self._heal_requested:
+                    why = self._heal_requested
+                    self._heal_requested = ""
+                    print(f"[supervisor] healing session on job request: {why}",
+                          flush=True)
+                    self.heal_session(why)
+                    continue
                 # give the boot engine time to settle before any rebuild
                 if time.time() - boot_ts < 150:
                     continue
-                # cheap liveness probe (refreshes last_engine_ok)
+                # cheap liveness probe (refreshes last_engine_ok).
+                # A single timeout is usually just a busy renderer on 0.1 CPU,
+                # so require 2 consecutive misses AND a cooldown before
+                # rebuilding — one blip used to trigger a disruptive rebuild.
                 try:
                     self.run(lambda: self.engine.page.evaluate("1"), timeout=60)
+                    liveness_fails = 0
                 except Exception as e:
-                    print(f"[supervisor] liveness failed ({str(e)[:80]}) -> rebuild",
-                          flush=True)
-                    self.hard_rebuild(boot=True)
+                    liveness_fails += 1
+                    since = time.time() - last_rebuild
+                    if liveness_fails >= 2 and since > 300:
+                        print(f"[supervisor] liveness failed x{liveness_fails} "
+                              f"({str(e)[:70]}) -> rebuild", flush=True)
+                        last_rebuild = time.time()
+                        liveness_fails = 0
+                        self.hard_rebuild(boot=True)
+                    else:
+                        print(f"[supervisor] liveness failed "
+                              f"({str(e)[:70]}) — attempt {liveness_fails}, "
+                              f"waiting (backoff)", flush=True)
                     continue
-                # login check every ~10 min
+                # login check every ~10 min; a failure here re-mints rather
+                # than re-seeding the same (possibly stale) cookies
                 if time.time() - last_sess > 600:
                     last_sess = time.time()
-                    self.ensure_session()
+                    if not self.ensure_session():
+                        self.heal_session("periodic login check failed")
             except Exception as e:
                 print(f"[supervisor] error: {str(e)[:150]}", flush=True)
 
@@ -702,14 +798,24 @@ class FlowAPI:
             except Exception as e:
                 out["steps"]["credits"] = {"ok": False, "error": str(e)[:150]}
             s = out["steps"]
+            # The mint is an OPTIONAL fallback: /generate drives the real
+            # composer, and flow mints its own reCAPTCHA there. Reporting a
+            # failed mint as a broken service was misleading, so the verdict is
+            # driven by the account read (the thing that actually gates work).
             if not s.get("credits", {}).get("ok"):
-                out["verdict"] = "logged out — seed FLOW_COOKIES_JSON / PROFILE_TAR_URL"
-            elif not s.get("mint", {}).get("ok"):
-                out["verdict"] = "logged in but reCAPTCHA mint fails (page/script issue)"
+                out["verdict"] = ("logged out — the supervisor re-mints every "
+                                  "~10 min; if this persists, check "
+                                  "FLOW_MASTER_TOKEN / FLOW_ACCOUNT_EMAIL")
+            elif not s.get("load", {}).get("ok"):
+                out["verdict"] = "page failed to load"
+            elif s.get("mint", {}).get("ok"):
+                out["verdict"] = ("logged in + minting. If /generate still "
+                                  "returns UNUSUAL_ACTIVITY, egress IP is "
+                                  "flagged — set FLOW_PROXY_URL.")
             else:
-                out["verdict"] = ("logged in + minting. If /generate still returns "
-                                  "UNUSUAL_ACTIVITY, egress IP is flagged — set "
-                                  "FLOW_PROXY_URL to a residential proxy.")
+                out["verdict"] = ("logged in and generation-ready (mint is an "
+                                  "optional fallback; /generate uses the app's "
+                                  "own reCAPTCHA token via the composer)")
             return out
         try:
             return self.run(job, timeout=150)
@@ -794,9 +900,14 @@ class FlowAPI:
                                          count=count, project_id=project_id,
                                          seed=seed)
             if not items:
-                return {"ok": False,
-                        "error": getattr(self.engine, "last_error", "")
-                                 or "generation failed"}
+                err = (getattr(self.engine, "last_error", "")
+                       or "generation failed")
+                if self._looks_like_dead_session(err):
+                    self._heal_requested = str(err)[:90]
+                    self.session_ok = False
+                    print(f"[generate] session looks dead ({str(err)[:70]}) -> "
+                          f"requested heal", flush=True)
+                return {"ok": False, "error": err}
             return {"ok": True, "media": items, **items[0]}
         return self._submit_job("generate", {
             "prompt": prompt, "model": model, "aspect": aspect,
@@ -827,11 +938,14 @@ class FlowAPI:
                                          count=count, project_id=project_id,
                                          seed=seed)
             if not items:
-                return {"ok": False,
-                        "error": getattr(self.engine, "last_error", "")
-                                 or "generation failed"}
+                err = (getattr(self.engine, "last_error", "")
+                       or "generation failed")
+                if self._looks_like_dead_session(err):
+                    self._heal_requested = str(err)[:90]
+                    self.session_ok = False
+                return {"ok": False, "error": err}
             return {"ok": True, "media": items, **items[0]}
-        return self.run(job, timeout=600)
+        return self.run(job, timeout=900)
 
     def upscale(self, media_uuid, resolution="2K", project_id=None):
         def job():
