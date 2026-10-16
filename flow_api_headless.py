@@ -903,29 +903,68 @@ class FlowAPI:
         threading.Thread(target=_runner, daemon=True).start()
         return jid
 
+    @staticmethod
+    def _looks_like_wedge(err) -> bool:
+        """Does this error mean the RENDERER is stuck (restart, don't retry
+        in place)? A wedged page ignores commands and every later call times
+        out, so the only fix is a fresh browser."""
+        low = str(err or "").lower()
+        return any(k in low for k in (
+            "timeout after", "timed out", "target closed",
+            "target page, context or browser has been closed",
+            "browser has been closed", "evaluate: timeout",
+            "not connected", "session closed"))
+
+    def _generate_attempt(self, prompt, model, aspect, seed, count,
+                          project_id):
+        # pre-flight auth upkeep: rotate PSIDTS if stale, refresh at if old
+        try:
+            if AUTH.jar:
+                AUTH.rotate()
+                AUTH.ensure_at(max_age=1800)
+        except Exception:
+            pass
+        return self.engine.generate(prompt, model=model, aspect=aspect,
+                                    count=count, project_id=project_id,
+                                    seed=seed)
+
+    def _generate_job(self, prompt, model=None, aspect=None, seed=None,
+                      count=1, project_id=None):
+        """Shared body for both generate entry points: one wedge-retry, then
+        classify the failure so a dead session asks for a re-mint."""
+        items = None
+        for attempt in (0, 1):
+            try:
+                items = self._generate_attempt(prompt, model, aspect, seed,
+                                               count, project_id)
+                break
+            except Exception as e:
+                msg = str(e)[:140]
+                if attempt == 0 and self._looks_like_wedge(msg):
+                    print(f"[generate] engine wedged ({msg}) -> restart + "
+                          f"retry", flush=True)
+                    try:
+                        self.engine.restart()      # direct relaunch, no queue
+                    except Exception as re_:
+                        print(f"[generate] restart failed: {str(re_)[:100]}",
+                              flush=True)
+                    continue
+                return {"ok": False, "error": msg}
+        if not items:
+            err = getattr(self.engine, "last_error", "") or "generation failed"
+            if self._looks_like_dead_session(err):
+                self._heal_requested = str(err)[:90]
+                self.session_ok = False
+                print(f"[generate] session looks dead ({str(err)[:70]}) -> "
+                      f"requested heal", flush=True)
+            return {"ok": False, "error": err}
+        return {"ok": True, "media": items, **items[0]}
+
     def submit_generate(self, prompt, model=None, aspect=None, seed=None,
                         project_id=None, count=1):
         def job():
-            # pre-flight auth upkeep: rotate PSIDTS if stale, refresh at if old
-            try:
-                if AUTH.jar:
-                    AUTH.rotate()
-                    AUTH.ensure_at(max_age=1800)
-            except Exception:
-                pass
-            items = self.engine.generate(prompt, model=model, aspect=aspect,
-                                         count=count, project_id=project_id,
-                                         seed=seed)
-            if not items:
-                err = (getattr(self.engine, "last_error", "")
-                       or "generation failed")
-                if self._looks_like_dead_session(err):
-                    self._heal_requested = str(err)[:90]
-                    self.session_ok = False
-                    print(f"[generate] session looks dead ({str(err)[:70]}) -> "
-                          f"requested heal", flush=True)
-                return {"ok": False, "error": err}
-            return {"ok": True, "media": items, **items[0]}
+            return self._generate_job(prompt, model, aspect, seed, count,
+                                      project_id)
         return self._submit_job("generate", {
             "prompt": prompt, "model": model, "aspect": aspect,
             "seed": seed, "count": count, "project_id": project_id}, job)
@@ -945,23 +984,8 @@ class FlowAPI:
     def generate(self, prompt, model=None, aspect=None, seed=None,
                  project_id=None, count=1):
         def job():
-            try:
-                if AUTH.jar:
-                    AUTH.rotate()
-                    AUTH.ensure_at(max_age=1800)
-            except Exception:
-                pass
-            items = self.engine.generate(prompt, model=model, aspect=aspect,
-                                         count=count, project_id=project_id,
-                                         seed=seed)
-            if not items:
-                err = (getattr(self.engine, "last_error", "")
-                       or "generation failed")
-                if self._looks_like_dead_session(err):
-                    self._heal_requested = str(err)[:90]
-                    self.session_ok = False
-                return {"ok": False, "error": err}
-            return {"ok": True, "media": items, **items[0]}
+            return self._generate_job(prompt, model, aspect, seed, count,
+                                      project_id)
         return self.run(job, timeout=900)
 
     def upscale(self, media_uuid, resolution="2K", project_id=None):

@@ -117,6 +117,16 @@ for err, want in [("create_project failed: None", True),
     check(f"{err[:38]!r} -> {want}", got == want)
 
 
+# ── 5. wedge classification (restart) vs plain failure ──────────────────────
+print("\n[5] error classification: wedged renderer vs plain failure")
+for err, want in [("Runtime.evaluate: timeout after 60s", True),
+                  ("Locator.count: Target page, context or browser has been closed", True),
+                  ("browser has been closed", True),
+                  ("prompt rejected by safety filters", False),
+                  ("ogiZ0b response had no media", False)]:
+    got = F.FlowAPI._looks_like_wedge(err)
+    check(f"{err[:44]!r} -> {want}", got == want)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)
