@@ -532,6 +532,7 @@ class HeadlessEngine:
         self._live_at = ""            # app's own at token (captured from its body)
         self._force_reseed = False    # set by restart(reseed=True)
         self.last_error = ""          # last engine-side failure (surfaced by /health)
+        self.mint_error = ""          # optional reCAPTCHA fallback failure
 
     # ── lifecycle ────────────────────────────────────────────────
     def start(self, force_heavy_chrome: bool = False):
@@ -966,8 +967,12 @@ class HeadlessEngine:
         r = self.page.evaluate(JS_MINT.replace("'GENERATE'", json.dumps(action)),
                                SITE_KEY, timeout=120)
         if not (r or {}).get("ok"):
-            self.last_error = f"mint failed: {(r or {}).get('err')}"
-            _log(f"[!] {self.last_error}")
+            # The mint is an OPTIONAL fallback — /generate drives the real
+            # composer and flow mints its own token there. Recording it in
+            # last_error made a healthy service look broken on the dashboard,
+            # so keep it in its own field.
+            self.mint_error = str((r or {}).get("err"))
+            _log(f"[!] mint failed (optional fallback): {self.mint_error}")
             return ""
         return r.get("token", "")
 

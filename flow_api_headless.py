@@ -724,6 +724,9 @@ class FlowAPI:
             "boot_error": self.boot_error,
             "last_error": ((getattr(self.engine, "last_error", "") if self.engine
                             else "") or self.boot_error),
+            # informational only: the reCAPTCHA mint is an optional fallback
+            "mint_error": (getattr(self.engine, "mint_error", "")
+                           if self.engine else ""),
             "last_engine_ok_age_s": round(time.time() - self.last_engine_ok, 1)
                                     if self.last_engine_ok else -1,
         }
