@@ -1256,8 +1256,23 @@ class HeadlessEngine:
                 if items:
                     self.last_error = ""
                     return items
+        # An ogiZ0b response arrived but carried no media. That is usually a
+        # transient (Google-side throttle, or two generations racing), and a
+        # fresh page normally clears it — so retry once, and log enough of the
+        # body to tell an error frame from an empty success.
         self.last_error = "ogiZ0b response had no media"
-        _log(f"[!] generate: {self.last_error}")
+        _log(f"[!] generate: {self.last_error}; body[:300]="
+             f"{str(body)[:300]!r} rpcids={[p[0] for p in parsed][:6]}")
+        if _escalate:
+            _log("[*] generate: retrying once on a fresh page (no-media heal)")
+            try:
+                self.restart()
+            except Exception as e:
+                _log(f"[!] restart failed: {str(e)[:120]}")
+                return None
+            return self.generate(prompt, model=model, aspect=aspect,
+                                 count=count, project_id=project_id,
+                                 seed=seed, _escalate=False)
         return None
 
     @staticmethod

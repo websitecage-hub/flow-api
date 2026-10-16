@@ -785,8 +785,21 @@ class FlowAPI:
                     ua: navigator.userAgent,
                     brands: (navigator.userAgentData&&navigator.userAgentData.brands)||null,
                     url: location.href, title: document.title})""")
-                out["steps"]["fingerprint"] = {"ok": fp.get("webdriver") in (None, False)
-                                               and fp.get("plugins", 0) > 0, **fp}
+                # Stealth is judged on the signals we can actually control.
+                # `plugins` is 0 in ANY chrome-headless-shell, so requiring >0
+                # reported a healthy engine as "fingerprint broken" — report it
+                # as informational instead.
+                ua = str(fp.get("ua") or "")
+                stealth_ok = (fp.get("webdriver") in (None, False)
+                              and "HeadlessChrome" not in ua)
+                out["steps"]["fingerprint"] = {
+                    "ok": stealth_ok,
+                    "webdriver_hidden": fp.get("webdriver") in (None, False),
+                    "ua_clean": "HeadlessChrome" not in ua,
+                    "plugins": fp.get("plugins", 0),
+                    "note": ("plugins=0 is normal for chrome-headless-shell"
+                             if fp.get("plugins", 0) == 0 else ""),
+                    **{k: v for k, v in fp.items() if k != "ua"}}
             except Exception as e:
                 out["steps"]["fingerprint"] = {"ok": False, "error": str(e)[:150]}
             try:
