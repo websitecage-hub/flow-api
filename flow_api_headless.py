@@ -349,11 +349,13 @@ class FlowAPI:
             print(f"[*] SIGKILLed {killed} stale node driver(s)", flush=True)
         return killed
 
-    def run(self, fn, timeout=600, _boot=False):
+    def run(self, fn, timeout=600, _boot=False, _rebuild_on_timeout=True):
         """Enqueue fn on the worker and wait up to `timeout`. NEVER holds a
         lock while waiting — one slow call must not block every other call.
         On timeout the worker is considered wedged: hard-rebuild the engine
-        (unless this call IS the boot) and raise."""
+        (unless this call IS the boot, or the caller manages recovery itself
+        via _rebuild_on_timeout=False — the supervisor counts consecutive
+        liveness failures and applies a cooldown before rebuilding)."""
         if not self._ready.is_set():
             raise RuntimeError("engine not started")
         if self._thread is None or not self._thread.is_alive():
@@ -371,7 +373,8 @@ class FlowAPI:
                 # their pages mid-flight ('Target closed' crashes).
                 with self._counter_lock:
                     others_active = self._active > 1
-                if not _boot and not self._rebuild_inflight and not others_active:
+                if not _boot and _rebuild_on_timeout and not self._rebuild_inflight \
+                        and not others_active:
                     try:
                         self.hard_rebuild()
                     except Exception as e:
@@ -498,7 +501,7 @@ class FlowAPI:
         def job():
             return bool(self.engine and self.engine.ensure_session())
         try:
-            ok = bool(self.run(job, timeout=300))
+            ok = bool(self.run(job, timeout=300, _rebuild_on_timeout=False))
             self.session_ok = ok
             if ok:
                 self.last_recover = time.time()
@@ -561,7 +564,7 @@ class FlowAPI:
         ok = False
         try:
             ok = bool(self.run(lambda: self.engine.credits() is not None,
-                               timeout=240))
+                               timeout=240, _rebuild_on_timeout=False))
         except Exception as e:
             print(f"[heal] verify failed: {str(e)[:130]}", flush=True)
         self.session_ok = ok
@@ -655,7 +658,8 @@ class FlowAPI:
                 # so require 2 consecutive misses AND a cooldown before
                 # rebuilding — one blip used to trigger a disruptive rebuild.
                 try:
-                    self.run(lambda: self.engine.page.evaluate("1"), timeout=60)
+                    self.run(lambda: self.engine.page.evaluate("1"), timeout=60,
+                             _rebuild_on_timeout=False)
                     liveness_fails = 0
                 except Exception as e:
                     liveness_fails += 1
