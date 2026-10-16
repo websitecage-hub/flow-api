@@ -166,9 +166,12 @@ def rotate_psidts(jar: dict, session: Optional["cffi.Session"] = None):
     The seed session must be UNBOUND (see UNBOUND_FEATURES) for this to work
     from datacenter IPs.
     """
-    s = session or _session()
-    for name, value in jar.items():
-        s.cookies.set(name, value, domain=".google.com")
+    s = session or restore_session(jar=jar)
+    # NOTE: do NOT build this session with a `for name, value: set(name, value,
+    # domain='.google.com')` loop. Rotating inside a lossy/mismatched cookie
+    # context yields a PSIDTS that breaks a previously-good session
+    # (accounts.google.com/CookieMismatch) even though RotateCookies answers
+    # 200. restore_session preserves per-cookie domain + Secure.
     r = s.post(
         "https://accounts.google.com/RotateCookies",
         headers={
@@ -188,6 +191,10 @@ def rotate_psidts(jar: dict, session: Optional["cffi.Session"] = None):
                 if c.value and c.value != old:
                     jar[c.name] = c.value
                     refreshed = True
+    if refreshed:
+        # keep the full records (used to rebuild sessions + seed the browser)
+        # in step with the rotated values, or the next session is stale
+        sync_records(jar)
     return r.status_code, refreshed
 
 
@@ -201,6 +208,55 @@ _XSRF_RE = re.compile(r'"xsrf","([^"]+)"')
 # domain scope and `Secure`, which silently de-authenticates __Secure-* cookies.
 LAST_RECORDS: list = []
 _RECORDS_FILE = ROOT / "sessions" / "flow.cookies.records.json"
+
+
+def sync_records(jar: Optional[dict] = None) -> bool:
+    """Keep LAST_RECORDS (and the on-disk copy) in step with the live jar.
+
+    Rotation mutates the plain {name: value} dict, but the RECORDS are what
+    rebuild an HTTP session and what the engine seeds the browser from. Two
+    ways they drift:
+      * a value changes (PSIDTS rotates) -> update in place;
+      * a name APPEARS that the mint never set. `__Secure-1PSIDTS` is absent
+        from the mint entirely and is created by the first RotateCookies call,
+        so updating-only silently dropped it. Google then expects a PSIDTS the
+        browser was never given, and every request 401s (~90s after boot,
+        which is exactly when rotation first runs).
+    """
+    try:
+        if not LAST_RECORDS:
+            return False
+        src = jar or {}
+        if not src:
+            return False
+        changed = False
+        for rec in LAST_RECORDS:
+            v = src.get(rec.get("name", ""))
+            if v and rec.get("value") != v:
+                rec["value"] = v
+                changed = True
+        have = {r.get("name") for r in LAST_RECORDS}
+        for name, val in src.items():
+            if not val or name in have:
+                continue
+            LAST_RECORDS.append({
+                "name": name, "value": val, "domain": ".google.com",
+                "path": "/",
+                "secure": (name.startswith("__Secure")
+                           or name.startswith("__Host") or name == "SAPISID"),
+                "httpOnly": False,
+            })
+            changed = True
+        if changed:
+            try:
+                _RECORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                _RECORDS_FILE.write_text(json.dumps(LAST_RECORDS),
+                                         encoding="utf-8")
+            except Exception:
+                pass
+        return changed
+    except Exception:
+        return False
 
 
 def load_records() -> list:
@@ -222,7 +278,21 @@ def restore_session(records=None, jar: Optional[dict] = None):
     s = _session()
     recs = records if records is not None else load_records()
     if recs:
+        # Google sets the same name for several domains (.google.com AND
+        # country variants like .google.co.in). Sending all of them makes the
+        # cookie set mutually inconsistent -> accounts.google.com/CookieMismatch.
+        # Pick ONE per name, preferring the google.com scope.
+        best: dict = {}
         for c in recs:
+            nm = c.get("name") or ""
+            if not nm:
+                continue
+            dom = (c.get("domain") or "").lower()
+            rank = 0 if dom in (".google.com", "google.com") else 1
+            prev = best.get(nm)
+            if prev is None or rank < prev[0]:
+                best[nm] = (rank, c)
+        for _rank, c in best.values():
             try:
                 s.cookies.set(c.get("name", ""), c.get("value", ""),
                               domain=c.get("domain") or ".google.com",

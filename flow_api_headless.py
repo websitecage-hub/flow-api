@@ -168,10 +168,11 @@ class _AuthState:
         try:
             fp = ROOT / "sessions" / "flow.cookies.full.json"
             fp.parent.mkdir(parents=True, exist_ok=True)
-            # Write FULL records (name/value/domain/path/secure) when we have
-            # them: the engine seeds the browser from this file, and flattening
-            # everything to .google.com without per-cookie `Secure` leaves
-            # __Secure-* cookies dropped and the browser logged out.
+            # Make the records match the live jar BEFORE writing them: rotation
+            # updates self.jar, and the engine seeds the browser + rebuilds
+            # HTTP sessions from these records. Writing mint-time values here
+            # shipped a dead PSIDTS to the browser on every re-seed.
+            _auth.sync_records(self.jar)
             recs = _auth.load_records()
             if recs:
                 fp.write_text(json.dumps(recs), encoding="utf-8")
