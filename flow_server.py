@@ -126,15 +126,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = obj if isinstance(obj, bytes) else json.dumps(obj).encode("utf-8")
         if not isinstance(obj, bytes):
             ctype = "application/json"
+        head_only = getattr(self, "_head", False)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        # Content-Length is the length the BODY WOULD have, even for HEAD
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
+        if head_only:
+            return
         try:
             self.wfile.write(body)
         except Exception:
@@ -155,10 +159,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self._send(200, {"ok": True})
 
+    def do_HEAD(self):
+        """UptimeRobot (and other monitors) may be configured to probe with
+        HEAD. Without this, BaseHTTPRequestHandler answers 501 and the monitor
+        reports the service DOWN while it is perfectly healthy."""
+        self._head = True
+        self.do_GET()
+
     def do_GET(self):
         if not self._gate(is_post=False, need_auth=False):
             return
         p = urllib.parse.urlparse(self.path)
+        # tolerate a trailing slash: "/health/" is a common monitor typo and
+        # used to 404, which reads as DOWN on the dashboard
+        if p.path != "/" and p.path.endswith("/"):
+            p = p._replace(path=p.path.rstrip("/"))
         qs = urllib.parse.parse_qs(p.query)
         st = load_state()
         if p.path == "/health":
@@ -188,6 +203,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
+                if getattr(self, "_head", False):
+                    return
                 try:
                     self.wfile.write(data)
                 except Exception:
