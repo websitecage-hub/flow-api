@@ -740,6 +740,11 @@ class Context:
                 for rid, ts in list(self._paused_ids.items()):
                     if now - ts > 25:
                         self._paused_ids.pop(rid, None)
+                        # Log it: a request stuck this long means our release
+                        # failed, and if it is the page's own API call the
+                        # awaited evaluate will hang until it is freed.
+                        print(f"[cdp] releasing stalled request {rid[:12]} "
+                              f"(paused {now - ts:.0f}s)", flush=True)
                         try:
                             self.page._send_async("Fetch.continueRequest",
                                                   {"requestId": rid})

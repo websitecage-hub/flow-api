@@ -764,6 +764,16 @@ class FlowAPI:
         """Step-by-step remote self-test: does the browser boot, load Flow,
         spoof the fingerprint, mint a reCAPTCHA token, and read the account?
         Distinguishes {no engine, no network, not logged in, reCAPTCHA wall}."""
+        # Check BEFORE dispatching: the self-test needs the worker, so if a
+        # job holds it, queueing here just blocks until the caller gives up
+        # (HTTP 000 on the monitor). The in-job check below cannot run because
+        # the worker is busy by definition.
+        if self.is_busy():
+            return {"ok": True, "busy": True,
+                    "steps": {"engine": {"ok": self.engine is not None}},
+                    "verdict": ("engine is busy with another job — re-run "
+                                "/diag once it finishes")}
+
         def job():
             out: dict = {"steps": {}}
             eng = self.engine

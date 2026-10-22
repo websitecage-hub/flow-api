@@ -396,19 +396,30 @@ JS_RPC = """async ({rpcid, payload, at, pid, base}) => {
     ? base
     : location.origin + '/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=' +
       rpcid + '&source-path=' + encodeURIComponent(src) + '&hl=en-GB&rt=c';
+  // BOUND the fetch. Without a deadline an unsettled request (a request left
+  // paused by our own Fetch interception, or a throttled endpoint) hangs the
+  // promise forever, and because evaluate() awaits it the CDP call burns its
+  // full timeout and looks like a wedged renderer. Failing at 45s turns that
+  // into a normal, diagnosable error.
+  const ctl = new AbortController();
+  const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 45000);
   try {
     const url = new URL(u, location.origin);
     url.searchParams.set('rpcids', rpcid);
     url.searchParams.set('source-path', src);
     const r = await fetch(url.toString(), {
-      method: 'POST', credentials: 'include',
+      method: 'POST', credentials: 'include', signal: ctl.signal,
       headers: {'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
                 'x-same-domain': '1'},
       body: body.toString()
     });
     const text = await r.text();
+    clearTimeout(to);
     return {status: r.status, body: text};
-  } catch (e) { return {status: -1, err: String(e).slice(0, 300)}; }
+  } catch (e) {
+    clearTimeout(to);
+    return {status: -1, err: String(e).slice(0, 300)};
+  }
 }"""
 
 JS_SCRAPE_AT = """() => {
