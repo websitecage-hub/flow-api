@@ -127,6 +127,35 @@ for err, want in [("Runtime.evaluate: timeout after 60s", True),
     got = F.FlowAPI._looks_like_wedge(err)
     check(f"{err[:44]!r} -> {want}", got == want)
 
+# ── 6. the feature catalogue must be complete and self-consistent ───────────
+print("\n[6] feature catalogue (/models)")
+import flow_headless as FH  # noqa: E402
+
+cat = F.FlowAPI.models(type("S", (), {})())  # no instance state needed
+check("catalogue ok", cat.get("ok") is True, str(cat.get("error", ""))[:60])
+models = cat.get("models") or []
+check("every wire model exposed", len(models) == len(FH.MODEL_WIRE),
+      f"{len(models)} vs {len(FH.MODEL_WIRE)}")
+check("default model flagged",
+      any(m["default"] for m in models))
+check("model ids resolved from the enum",
+      all(m["model_id"] for m in models),
+      str([m["key"] for m in models if not m["model_id"]]))
+check("every model carries its human alias",
+      all(m["aliases"] for m in models),
+      str([m["key"] for m in models if not m["aliases"]]))
+aspects = cat.get("aspects") or []
+check("every aspect ratio exposed", len(aspects) == len(FH.ASPECT_WIRE),
+      f"{len(aspects)} vs {len(FH.ASPECT_WIRE)}")
+check("aspect wire ints preserved",
+      {a["ratio"]: a["wire"] for a in aspects} == dict(FH.ASPECT_WIRE))
+check("upscale targets listed",
+      set(cat.get("upscale") or []) == {"2K", "4K"})
+check("full enum published",
+      len(cat.get("model_enum_all") or {}) == len(FH.MODEL_ENUM))
+check("endpoints documented",
+      "/models" in (cat.get("endpoints", {}).get("GET") or []))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

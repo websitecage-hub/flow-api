@@ -1033,6 +1033,89 @@ class FlowAPI:
                     if out else {"ok": False, "error": "upscale failed"})
         return self.run(job, timeout=600)
 
+    # ── feature catalogue: everything the Flow side exposes ──────
+    def models(self):
+        """Full catalogue — models, aspects, upscale targets, endpoints.
+
+        Built from the engine's tables (verified against the live app), so it
+        answers instantly and works even while a job holds the worker."""
+        try:
+            from flow_headless import (MODEL_WIRE, MODEL_ENUM, ASPECT_WIRE,
+                                       MODEL_DISPLAY, DEFAULT_MODEL)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:150]}
+        id_of = {v: k for k, v in MODEL_ENUM.items()}
+        aliases: dict = {}
+        for disp, wire in MODEL_DISPLAY.items():
+            aliases.setdefault(wire, []).append(disp)
+        models = [{
+            "key": code,
+            "label": meta.get("label", code),
+            "model_id": id_of.get(code),
+            "gemini": meta.get("gemini", ""),
+            "default": bool(meta.get("default")),
+            "deprecated": bool(meta.get("note")),
+            "note": meta.get("note", ""),
+            "aliases": sorted(aliases.get(code, [])),
+            "kind": ("image-thinking" if "THINKING" in code else "image"),
+        } for code, meta in MODEL_WIRE.items()]
+        st = load_state()
+        return {
+            "ok": True,
+            "default_model": DEFAULT_MODEL,
+            "current": {"model": st.get("model", DEFAULT_MODEL),
+                        "project": st.get("project_id", "")},
+            "models": models,
+            "model_enum_all": {str(k): v for k, v in sorted(MODEL_ENUM.items())},
+            "aspects": [{"ratio": r, "wire": w}
+                        for r, w in ASPECT_WIRE.items()],
+            "aspect_default": "16:9",
+            "count": "1 (Flow returns 2 images per call)",
+            "upscale": ["2K", "4K"],
+            "recaptcha_actions": {"image": "IMAGE_GENERATION",
+                                  "text": "GENERATE"},
+            "endpoints": {
+                "GET": ["/health", "/models", "/session", "/whoami", "/diag",
+                        "/credits", "/projects", "/project", "/project/new",
+                        "/history", "/jobs", "/jobs/<id>", "/logs", "/media/<uuid>",
+                        "/media/<uuid>?info=1", "/restart", "/ui"],
+                "POST": ["/generate", "/upscale", "/cookies"],
+            },
+            "generate_params": {
+                "prompt": "required, string",
+                "model": "optional (see models[].key or models[].aliases)",
+                "aspect": "optional (see aspects[].ratio)",
+                "count": "int, default 1",
+                "seed": "optional int (reproducible batch)",
+                "project_id": "optional; creates one if omitted",
+            },
+            "limits": {"one_job_at_a_time": True,
+                       "typical_job_seconds": "150-400 on the 0.1-CPU free tier"},
+        }
+
+    def whoami(self):
+        """Account profile via the app's own `o30O0e` RPC."""
+        def job():
+            d = self.engine.call(
+                "o30O0e",
+                [["me"], [[["person.photo", "person.name", "person.email",
+                            "person.metadata"]], None, [1, 7, 10]]])
+            return {"ok": d is not None, "profile": d}
+        try:
+            return self.run(job, timeout=150)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:160]}
+
+    def media_info(self, media_uuid):
+        """Media detail (signed URLs, seed, prompt) via `as29s`."""
+        def job():
+            d = self.engine.call("as29s", [media_uuid])
+            return {"ok": d is not None, "media": d}
+        try:
+            return self.run(job, timeout=150)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:160]}
+
     def history(self, project_id=None):
         def job():
             pid = project_id or load_state().get("project_id", "")

@@ -264,6 +264,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, api.history())
         elif p.path == "/credits":
             self._send(200, api.credits())
+        elif p.path == "/models":
+            # full catalogue: every model, aspect, upscale target, endpoint.
+            # Static tables -> instant, and safe to call while a job runs.
+            fn = getattr(api, "models", None)
+            self._send(200, fn() if fn else {"ok": False,
+                                             "error": "models unavailable in this role"})
+        elif p.path == "/whoami":
+            fn = getattr(api, "whoami", None)
+            self._send(200, fn() if fn else {"ok": False,
+                                             "error": "whoami unavailable in this role"})
         elif p.path == "/projects":
             self._send(200, api.projects())
         elif p.path == "/project":
@@ -278,6 +288,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(500, {"ok": False, "error": "project create failed"})
         elif p.path.startswith("/media/"):
             mid = urllib.parse.unquote(p.path[len("/media/"):])
+            if qs.get("info", [""])[0] in ("1", "true", "yes"):
+                # metadata only (signed URLs, seed, prompt) instead of bytes
+                fn = getattr(api, "media_info", None)
+                self._send(200, fn(mid) if fn else
+                           {"ok": False, "error": "media_info unavailable"})
+                return
             fp = None
             for ext in ("jpg", "png", "webp"):
                 cand = Path(__file__).parent / "outputs" / f"{mid}.{ext}"
@@ -297,11 +313,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        headers={"Content-Disposition": f'attachment; filename="{Path(fp).name}"'})
         else:
             self._send(404, {"ok": False, "error": "not found",
-                             "endpoints": ["/health", "/restart", "/session", "/diag",
+                             "endpoints": ["/health", "/models", "/whoami",
+                                           "/restart", "/session", "/diag",
                                            "/generate", "/upscale", "/jobs",
                                            "/jobs/<id>", "/logs",
-                                           "/history", "/media/<uuid>", "/credits",
-                                           "/projects", "/project"]})
+                                           "/history", "/media/<uuid>",
+                                           "/media/<uuid>?info=1", "/credits",
+                                           "/projects", "/project", "/ui"]})
 
     def do_POST(self):
         # Drain the request body FIRST — if we 401/429 before reading it, the
@@ -334,6 +352,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not prompt:
                 self._send(400, {"ok": False, "error": "prompt required"})
                 return
+            # VALIDATE model/aspect instead of silently defaulting: a typo used
+            # to produce a BELUGA image and look like the request was honoured.
+            try:
+                from flow_headless import MODEL_WIRE, MODEL_DISPLAY, ASPECT_WIRE
+                want_m = (j.get("model") or "").strip().upper()
+                if want_m:
+                    ok_m = (want_m in MODEL_WIRE) or (want_m in MODEL_DISPLAY)
+                    if not ok_m:
+                        self._send(400, {
+                            "ok": False,
+                            "error": f"unknown model {j.get('model')!r}",
+                            "models": sorted(MODEL_WIRE),
+                            "aliases": sorted(MODEL_DISPLAY),
+                            "hint": "GET /models for the full catalogue",
+                        })
+                        return
+                want_a = (j.get("aspect") or "").strip()
+                if want_a and want_a not in ASPECT_WIRE:
+                    self._send(400, {
+                        "ok": False,
+                        "error": f"unknown aspect {want_a!r}",
+                        "aspects": sorted(ASPECT_WIRE),
+                        "hint": "GET /models for the full catalogue",
+                    })
+                    return
+            except ImportError:
+                pass
             print(f"[server] generate: {prompt[:60]!r}", flush=True)
             kw = dict(model=j.get("model") or None,
                       aspect=j.get("aspect") or None,
