@@ -685,11 +685,16 @@ class FlowAPI:
                 print(f"[supervisor] error: {str(e)[:150]}", flush=True)
 
     # ── fast, non-blocking status (Render health checks) ─────────
-    def _base_info(self):
-        st = load_state()
-        stale = (time.time() - self.last_engine_ok) > 180 if self.last_engine_ok else True
+    def _cached_rss(self):
+        """RSS numbers, cached ~10s. /health is the monitor endpoint: scanning
+        every process in /proc on each probe is wasted work, and on a 0.1-CPU
+        instance a generation can starve the HTTP thread long enough for a
+        monitor to time out and report DOWN."""
+        now = time.time()
+        c = getattr(self, "_rss_cache", None)
+        if c and (now - c[0]) < 10:
+            return c[1], c[2]
         rss = 0.0
-        rss_py = read_rss_mb()
         try:
             rss = round(total_tree_rss_mb(), 1)
         except Exception:
@@ -697,6 +702,17 @@ class FlowAPI:
                 rss = round(rss_mb_of(str(PROFILE)), 1)
             except Exception:
                 pass
+        try:
+            rss_py = read_rss_mb()
+        except Exception:
+            rss_py = 0.0
+        self._rss_cache = (now, rss, rss_py)
+        return rss, rss_py
+
+    def _base_info(self):
+        st = load_state()
+        stale = (time.time() - self.last_engine_ok) > 180 if self.last_engine_ok else True
+        rss, rss_py = self._cached_rss()
         # NOTE: no CDP calls here — Playwright sync API is thread-bound to
         # the worker; calling it from the HTTP thread poisons the engine
         # (greenlet 'cannot switch to a different thread').
