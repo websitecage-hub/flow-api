@@ -773,6 +773,15 @@ class FlowAPI:
                 return out
             out["steps"]["engine"] = {"ok": True, "exe": eng.exe,
                                       "rss_mb": round(rss_mb_of(str(PROFILE)), 1)}
+            # The self-test needs the worker to itself. Running it during a
+            # generation makes every step queue behind that job, time out, and
+            # report a bogus "cannot load / network?" failure — say BUSY instead.
+            if self.is_busy():
+                out["busy"] = True
+                out["verdict"] = ("engine is busy with another job — re-run "
+                                  "/diag once it finishes (the results below "
+                                  "would be meaningless)")
+                return out
             out["steps"]["proxy"] = {"set": bool(os.environ.get("FLOW_PROXY_URL", "").strip())}
             try:
                 url = eng.goto_app("/")

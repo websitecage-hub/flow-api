@@ -692,18 +692,42 @@ class Context:
             # a request left paused forever hangs the page — track it so the
             # sweeper can release it if our continue silently failed
             self._paused_ids[rid] = time.time()
+
+            def _release(params, fail=False):
+                """Verify the release. Fire-and-forget hid failures: a request
+                that stayed paused left the page's fetch promise unresolved,
+                so the awaited Runtime.evaluate hung for its full 60s timeout
+                and looked like a wedged renderer."""
+                method = "Fetch.failRequest" if fail else "Fetch.continueRequest"
+                for attempt in (0, 1):
+                    try:
+                        if fail:
+                            self.page._send(method, params, timeout=15)
+                        else:
+                            # retry once WITHOUT header overrides: a rejected
+                            # header is the common cause of a failed continue
+                            p2 = {"requestId": params["requestId"]}
+                            if attempt == 0 and "headers" in params:
+                                p2["headers"] = params["headers"]
+                            self.page._send(method, p2, timeout=15)
+                        self._paused_ids.pop(rid, None)
+                        return True
+                    except Exception as e:
+                        if attempt == 1:
+                            print(f"[cdp] {method} failed for {rid[:12]}: "
+                                  f"{str(e)[:100]} — sweeper will release",
+                                  flush=True)
+                return False
+
             try:
                 if chain.abort:
-                    self.page._send_async("Fetch.failRequest",
-                                          {"requestId": rid,
-                                           "errorReason": "Aborted"})
+                    _release({"requestId": rid, "errorReason": "Aborted"},
+                             fail=True)
                 elif chain.headers:
-                    hdrs = _clean_headers(chain.headers)
-                    self.page._send_async("Fetch.continueRequest",
-                                          {"requestId": rid, "headers": hdrs})
+                    _release({"requestId": rid,
+                              "headers": _clean_headers(chain.headers)})
                 else:
-                    self.page._send_async("Fetch.continueRequest",
-                                          {"requestId": rid})
+                    _release({"requestId": rid})
             except Exception:
                 pass
 
