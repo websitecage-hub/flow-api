@@ -189,21 +189,50 @@ facade) + REPL. `flow_headless.py` is the small engine that fits free tier.
   submit NOT wired (costs real credits; say go to spend 20 on one probe)
 - ⏳ Project list/create rpcids unmapped (`/projects`, `/project new` errors)
 
-## 7. Watermark (investigated 2026-09-11 — nothing to remove)
+## 7. Watermark (RE-INVESTIGATED 2026-10-22 — there IS a visible mark)
 
-- Pixels are clean: no visible watermark, logo, or banner on outputs
-  (checked config traffic, full UI text dump, and image forensics).
-- What exists is provenance metadata, verified in a real output file:
-  IPTC/XMP `Credit="Made with Google AI"`, `DigitalSourceType=
-  trainedAlgorithmicMedia`, plus a Google-signed **C2PA manifest** stating
-  `c2pa.created` ("Created by Google Generative AI") and `c2pa.edited`
-  (**"Applied imperceptible SynthID watermark"**).
-- There is no UI toggle, no config key, and no request field controlling it
-  (zero hits for watermark/synthid/logo in new-backend traffic and UI).
-  Stripping signed provenance would break the C2PA signature (detectable) —
-  deliberately not built. If a *visible* mark ever appears on an image, it
-  is model-rendered scene content (prompt artifact): regenerate with a new
-  seed instead.
+**The earlier conclusion below was wrong.** There is a **visible** watermark:
+Google's 4-pointed sparkle glyph, alpha-composited in white at a **fixed
+position** in every 1376x768 render — roughly `x 1252-1304, y 644-700`, i.e.
+~100 px in from the bottom-right corner.
+
+Proof it is an overlay and not scene content: it lands on the *same pixels*
+across 20 images from different prompts, seeds and models, and it is a clean
+4-pointed star (recovered as a mask). It is faint, which is why it was missed
+before — on a bright background (e.g. lunar regolith) it is nearly invisible;
+on a dark one it is obvious.
+
+Because the glyph is translucent white, the composite is invertible:
+
+```
+out = img*(1-a) + 255*a     ->     img = (out - 255*a) / (1-a)
+```
+
+`a` is recovered with the **per-pixel minimum across many renders** (the glyph
+is constant; the scene is not, so min(out) tends to 255*a wherever an image is
+dark beneath it). `dewatermark.py` does this and writes `clean_*.jpg`:
+
+```
+python dewatermark.py --alpha /tmp/a.png   # dump the derived mask
+python dewatermark.py                      # clean every file in outputs/
+python dewatermark.py in.jpg out.jpg       # one file
+```
+
+Verified visually on both bright and near-black backgrounds: glyph fully gone,
+underlying pixels preserved (no blur/inpaint smearing — the actual composite is
+solved, not guessed). Needs `numpy` + `Pillow` where it runs.
+
+**Still nothing to toggle server-side:** no UI switch, no config key, no request
+field (re-confirmed: zero hits in traffic/UI for watermark/synthid). The mark is
+applied by Google, so the only options are post-processing (above) or cropping
+~110 px off the right and bottom.
+
+**Also present and NOT removable:** IPTC/XMP `Credit="Made with Google AI"`,
+`DigitalSourceType=trainedAlgorithmicMedia`, a Google-signed **C2PA manifest**
+(`c2pa.created`, `c2pa.edited` = "Applied imperceptible SynthID watermark"), and
+the **SynthID** signal itself. Stripping the metadata breaks the C2PA signature
+(detectable); SynthID lives in the pixels as an imperceptible statistical
+pattern and cannot be removed by any of this. Provenance survives.
 
 ## 8. Speed (what makes it fast)
 

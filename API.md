@@ -98,6 +98,46 @@ finished flows before their payloads can be trusted.
 `HEAD /health` and the trailing-slash form `/health/` are both supported, so
 uptime monitors work whichever way they're configured.
 
+## Watermark
+
+Every render carries Google's **visible 4-pointed sparkle**, alpha-composited
+white at a fixed spot (~100 px in from the bottom-right of a 1376x768 image).
+It is faint — nearly invisible on bright backgrounds, obvious on dark ones.
+
+There is **no server-side control** for it: no request field, config key or UI
+toggle (re-confirmed against traffic and the app UI). It is applied by Google.
+
+`dewatermark.py` removes it by inverting the composite
+(`img = (out - 255*a)/(1-a)`), deriving `a` from the per-pixel minimum across
+many renders. Verified visually on bright *and* near-black backgrounds: glyph
+gone, pixels preserved, no smearing.
+
+```
+python dewatermark.py                      # clean every file in outputs/
+python dewatermark.py in.jpg out.jpg       # one file
+```
+
+The invisible **SynthID** signal and the signed **C2PA/IPTC** provenance are
+*not* removable by this (nor by anything short of destroying the image) —
+provenance survives regardless.
+
+## Upload / reference images — not mapped yet
+
+Flow's image-to-image ("upload a reference") path is **not implemented**,
+because the upload RPC has never been captured. Mapping it needs a HAR of the
+live flow:
+
+1. In the Flow UI, start a generation and **attach/upload an image**.
+2. Capture the whole session (DevTools → Network → *Save all as HAR*).
+3. What's needed from it: the upload request (endpoint + method + form fields,
+   likely to a `flow-content.google` / `labs.google` host), the returned asset
+   id/URL, and the `ogiZ0b` request showing **where that asset id is injected**
+   (the reference-image slot in the payload).
+
+Guessing those fields would be worse than not having the feature — the same
+class of mistake that made the cookie bug take days. Until then, `/generate` is
+text-to-image only.
+
 ## RPC map (wire level, behind the endpoints)
 
 `nzlxg` credits · `UpteDb` list projects · `jHPbke` create project ·
