@@ -271,6 +271,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, fn() if fn else {"ok": False,
                                              "error": "models unavailable in this role"})
         elif p.path == "/whoami":
+            # EXPERIMENTAL / OFF BY DEFAULT. The o30O0e payload below is from
+            # FLOW-INTERNALS.md but is unvalidated: calling it left the page
+            # wedged (Runtime.evaluate timeout), which would stall the same
+            # worker generations use. Gate it until the wire shape is proven.
+            if os.environ.get("FLOW_EXPERIMENTAL", "") != "1":
+                self._send(200, {"ok": False, "experimental": True,
+                                 "error": "disabled — set FLOW_EXPERIMENTAL=1 "
+                                          "to enable (unvalidated RPC; can "
+                                          "wedge the page for ~60s)"})
+                return
             fn = getattr(api, "whoami", None)
             self._send(200, fn() if fn else {"ok": False,
                                              "error": "whoami unavailable in this role"})
@@ -289,7 +299,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p.path.startswith("/media/"):
             mid = urllib.parse.unquote(p.path[len("/media/"):])
             if qs.get("info", [""])[0] in ("1", "true", "yes"):
-                # metadata only (signed URLs, seed, prompt) instead of bytes
+                # metadata only (signed URLs, seed, prompt) instead of bytes.
+                # EXPERIMENTAL/OFF BY DEFAULT: the as29s payload is unvalidated
+                # and returned nothing while wedging the page — see /whoami.
+                if os.environ.get("FLOW_EXPERIMENTAL", "") != "1":
+                    self._send(200, {"ok": False, "experimental": True,
+                                     "error": "disabled — set FLOW_EXPERIMENTAL=1 "
+                                              "to enable (unvalidated RPC)"})
+                    return
                 fn = getattr(api, "media_info", None)
                 self._send(200, fn(mid) if fn else
                            {"ok": False, "error": "media_info unavailable"})
