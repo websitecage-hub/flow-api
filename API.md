@@ -121,26 +121,78 @@ The invisible **SynthID** signal and the signed **C2PA/IPTC** provenance are
 *not* removable by this (nor by anything short of destroying the image) —
 provenance survives regardless.
 
-## Upload / reference images — not mapped yet
+## Upload / reference images — MAPPED (wire captured and decoded)
 
-Flow's image-to-image ("upload a reference") path is **not implemented**,
-because the upload RPC has never been captured. Mapping it needs a HAR of the
-live flow:
+Captured by driving the real UI (not guessed). The upload is **not** a separate
+multipart endpoint and has nothing to do with `flow-content.google`: the image
+bytes ride **inline in a normal batchexecute call**, RPC **`maseQ`**.
 
-1. In the Flow UI, start a generation and **attach/upload an image**.
-2. Capture the whole session (DevTools → Network → *Save all as HAR*).
-3. What's needed from it: the upload request (endpoint + method + form fields,
-   likely to a `flow-content.google` / `labs.google` host), the returned asset
-   id/URL, and the `ogiZ0b` request showing **where that asset id is injected**
-   (the reference-image slot in the payload).
+UI path: composer → **"Add ingredients to the prompt box"** → menu →
+**"Upload media"**. That opens the *native* file chooser (there is no
+`<input type=file>` in the DOM), so automation must either intercept
+`Page.fileChooserOpened` / use Playwright's `expect_file_chooser`, or drive it
+some other way. After the file is handed over, the app shows a consent gate
+(**"I agree"**) and an **"Add to prompt"** action; the media then appears under
+an **"Uploads"** collection with an **"Ingredient"** chip on the prompt.
 
-Guessing those fields would be worse than not having the feature — the same
-class of mistake that made the cookie bug take days. Until then, `/generate` is
-text-to-image only.
+Request:
+
+```
+POST /_/AiSandboxFrontend/data/batchexecute?rpcids=maseQ&source-path=/project/<id>
+content-type: application/x-www-form-urlencoded;charset=utf-8
+body: f.req=<urlencoded JSON>&at=<xsrf>
+```
+
+Decoded payload (base64 collapsed):
+
+```json
+[
+  [null, 22, null, null, null, "<projectId>", null, null, null, null,
+   ["<2553-char token>", 1]],
+  "<base64 of the raw image bytes>",     // /9j/4AAQ… == JPEG SOI on decode
+  "image/jpeg",                          // mime
+  1,
+  null, null, null, null,
+  "probe_upload.jpg",                    // filename
+  null,
+  "<uuid v4 upper>",
+  "<uuid v4 upper>"
+]
+```
+
+Field positions verified from the capture: project id at `[0][5]`, mime at
+`[2]`, filename at `[8]`, two generated UUIDs at `[10]`/`[11]`. Index `[1]` of
+the first element is the literal `22`; the 2553-char token at `[0][10][0]` is
+still unidentified in origin (may or may not be required).
+
+**Implementation note:** the upload should be issued from inside the page
+(`JS_RPC`-style fetch), the same way every other RPC in this service works.
+Do **not** build it on pure-HTTP batchexecute — see the transport finding
+below; that path is currently unverified.
+
+### Open issue: pure-HTTP batchexecute returns 400
+
+A control test proved this is **not** upload-specific. Sending `nzlxg`
+(credits) — an RPC the app itself calls successfully — from Python returns:
+
+```
+[["er",null,null,null,null,400,null,null,null,3], ...]   → HTTP 400
+```
+
+and it fails identically with: the token from `harvest_at` *and* from
+`WIZ_global_data.SNlM0e` (both verified present, 42 chars, colon+timestamp,
+correct shape); `source-path` both `/` and `/project/<id>`; and the browser's
+exact header set (content-type, referer, UA, `x-same-domain: 1`, client hints —
+the capture shows the browser sends **no** `x-goog-ext-*` headers and no
+`Origin`). Cookies are fine over HTTP — an authenticated `GET /` succeeds.
+
+So in-page `JS_RPC` is the proven path and the only one to build on. Whatever
+remains in the pure-HTTP path is unresolved and must not be assumed to work.
 
 ## RPC map (wire level, behind the endpoints)
 
-`nzlxg` credits · `UpteDb` list projects · `jHPbke` create project ·
+`nzlxg` credits · `maseQ` **upload media** (inline base64 image) ·
+`UpteDb` list projects · `jHPbke` create project ·
 `Zzl0ze` project history · `ogiZ0b` batch-generate images · `SPrCad` upscale ·
 `as29s` media detail · `o30O0e` profile · `cPZSdc` app config ·
 `Yizz8d` home defaults · `ngNC2` generation defaults · `HTrJv`/`tRARke` app +

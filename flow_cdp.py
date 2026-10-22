@@ -832,8 +832,12 @@ class Browser:
         port = _free_port()
         self._port = port
         cmd = [self.exe, *_CHROME_BASE, *self._args_full(port)]
+        # FLOW_CHROME_LOG=<path> keeps the browser's own logging instead of
+        # discarding it — the only way to see why a renderer died.
+        _logpath = os.environ.get("FLOW_CHROME_LOG", "")
+        _out = open(_logpath, "ab") if _logpath else subprocess.DEVNULL
         self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cmd, stdout=_out, stderr=subprocess.STDOUT,
             env=os.environ.copy(), start_new_session=True)
         ws_url = self._wait_for_devtools(port, timeout)
         self._conn = _Conn(ws_url)
