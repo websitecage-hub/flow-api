@@ -156,6 +156,55 @@ check("full enum published",
 check("endpoints documented",
       "/models" in (cat.get("endpoints", {}).get("GET") or []))
 
+# ── 6. media delivery ───────────────────────────────────────────────────────
+# /media/<uuid> 404'd for every image because FlowAPI.media() was a bare
+# `return None` stub AND nothing ever cached the bytes locally.
+import inspect  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_src = inspect.getsource(F.FlowAPI.media)
+check("media() is no longer a 'return None' stub",
+      "engine.history" in _src and "save_media_bytes" in _src)
+check("media() consults the disk cache first", "_cached_media" in _src)
+check("generation caches bytes before returning",
+      "save_media_bytes" in inspect.getsource(F.FlowAPI._generate_job))
+
+with tempfile.TemporaryDirectory() as _td:
+    _inst = F.FlowAPI.__new__(F.FlowAPI)
+    _inst._outputs_dir = lambda: Path(_td)
+    (Path(_td) / "aaa.jpg").write_bytes(b"x" * 100)        # too small
+    (Path(_td) / "bbb.jpg").write_bytes(b"y" * 20000)      # real file
+    check("undersized cache entry ignored", _inst._cached_media("aaa") is None)
+    check("cached media found by uuid",
+          str(_inst._cached_media("bbb")) == str(Path(_td) / "bbb.jpg"))
+
+    class _Resp:
+        def __init__(self, blob):
+            self._b = blob
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    _real = F.urllib.request.urlopen
+    try:
+        F.urllib.request.urlopen = lambda *a, **k: _Resp(b"short")
+        check("short download rejected (no junk cached)",
+              _inst.save_media_bytes("http://x/y.jpg", "ccc") is None)
+        F.urllib.request.urlopen = lambda *a, **k: _Resp(b"z" * 30000)
+        _p = _inst.save_media_bytes("http://x/y.jpg", "ddd")
+        check("good download cached as <uuid>.jpg",
+              _p is not None and _p.name == "ddd.jpg"
+              and _p.stat().st_size == 30000)
+    finally:
+        F.urllib.request.urlopen = _real
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)
