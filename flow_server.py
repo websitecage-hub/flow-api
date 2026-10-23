@@ -105,11 +105,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return True, 0
 
     def _auth_ok(self):
-        """POST endpoints need a key when API_KEYS is configured."""
+        """Key required when API_KEYS is configured.
+
+        Accepts the Bearer header for programs *and* ?key=<secret> so a plain
+        browser link or <img src="..."> works — an img tag cannot set headers,
+        which is exactly why the media URLs looked broken when opened directly.
+        """
         if not API_KEYS:
             return True
         auth = self.headers.get("Authorization", "") or ""
-        return auth.startswith("Bearer ") and auth[7:].strip() in API_KEYS
+        if auth.startswith("Bearer ") and auth[7:].strip() in API_KEYS:
+            return True
+        try:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            for field in ("key", "token", "api_key"):
+                v = (q.get(field) or [""])[0].strip()
+                if v and v in API_KEYS:
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _gate(self, is_post, need_auth):
         ok, retry = self._rate_ok(is_post)
@@ -188,7 +203,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, api.restart())
             except Exception as e:
                 self._send(500, {"ok": False, "error": str(e)[:200]})
-        elif p.path in ("/ui", "/ui/", "/ui/index.html"):
+        elif p.path in ("/", "/ui", "/ui/", "/ui/index.html", "/index.html"):
             # Live test bench — public (rate-limited, never auth-gated) so you
             # can try generation from your phone anywhere. Serves the static
             # page; all API calls it makes go through the same endpoints.

@@ -43,6 +43,8 @@ RUN pip install --no-cache-dir -r requirements.docker.txt \
 # for compat but is never the engine under FLOW_ENGINE=headless.
 COPY flow_api.py flow_headless.py flow_api_headless.py flow_auth.py \
      flow_cdp.py flow_server.py flow_store.py worker.py gen.py menu.py flow.py ./
+# Watermark removal, with the alpha mask embedded (Pillow only, no numpy)
+COPY dewatermark_server.py ./
 COPY import_cookies.py ./
 COPY start.sh ./
 COPY ui/ ./ui/

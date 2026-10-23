@@ -205,6 +205,57 @@ with tempfile.TemporaryDirectory() as _td:
     finally:
         F.urllib.request.urlopen = _real
 
+# ── 7. watermark removal ────────────────────────────────────────────────────
+import io  # noqa: E402
+import os as _os  # noqa: E402
+
+import dewatermark_server as DW  # noqa: E402
+
+check("dewatermarker reports available", DW.available() is True)
+_alpha, _w = DW._mask()
+check("alpha mask embedded and non-degenerate",
+      _w == DW.BOX[2] - DW.BOX[0] and max(_alpha) > 40,
+      f"w={_w} max={max(_alpha)}")
+check("mask height matches the box",
+      len(_alpha) // _w == DW.BOX[3] - DW.BOX[1])
+
+from PIL import Image as _Image  # noqa: E402
+# a synthetic render: mid-grey field, so the glyph region brightens measurably
+_buf = io.BytesIO()
+_Image.new("RGB", (1376, 768), (120, 120, 120)).save(_buf, format="JPEG",
+                                                      quality=90)
+_before = _buf.getvalue()
+_after = DW.clean_bytes(_before)
+check("clean_bytes returns bytes", isinstance(_after, bytes) and len(_after) > 500)
+check("clean_bytes changes a 1376x768 render",
+      _after != _before)
+check("clean_bytes leaves other sizes alone",
+      DW.clean_bytes(_Image.new("RGB", (64, 64), (1, 2, 3)).tobytes()) != b"" and
+      DW.clean_bytes(b"not-an-image") == b"not-an-image")
+check("output stays within 1.5x of the source (no size blow-up)",
+      len(_after) < len(_before) * 1.5, f"{len(_before)} -> {len(_after)}")
+_os.environ["FLOW_DEWATERMARK"] = "0"
+check("FLOW_DEWATERMARK=0 disables it", DW.available() is False)
+check("disabled clean_bytes is a pass-through",
+      DW.clean_bytes(_before) == _before)
+del _os.environ["FLOW_DEWATERMARK"]
+check("re-enabled after unsetting the flag", DW.available() is True)
+
+# ── 8. browser-friendly auth + UI wiring ────────────────────────────────────
+_srv = (Path(__file__).resolve().parent.parent / "flow_server.py").read_text(
+    encoding="utf-8")
+check("auth accepts ?key= for browser/img access",
+      '"key"' in _srv and "parse_qs" in _srv.split("def _auth_ok")[1][:1200])
+check("UI is served at the root path", '"/", "/ui"' in _srv)
+check("UI file shipped in the image",
+      (Path(__file__).resolve().parent.parent / "ui" / "index.html").exists())
+_dfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(
+    encoding="utf-8")
+check("image copies the dewatermarker", "dewatermark_server.py" in _dfile)
+_reqs = (Path(__file__).resolve().parent.parent /
+         "requirements.docker.txt").read_text(encoding="utf-8")
+check("image installs Pillow", "Pillow" in _reqs)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

@@ -98,6 +98,29 @@ finished flows before their payloads can be trusted.
 `HEAD /health` and the trailing-slash form `/health/` are both supported, so
 uptime monitors work whichever way they're configured.
 
+## Console UI
+
+Open **`/`** (or `/ui`) on the service — a single self-contained page, no CDN,
+so it always loads. It shows live health (engine, busy, memory, session),
+lets you generate with model/aspect/count, streams job progress, renders the
+results as a gallery with download links, and gives one-click access to every
+GET endpoint plus the full model catalogue.
+
+Paste your API key once; it is kept in that browser's `localStorage` only.
+
+## Auth for browsers
+
+Programs send `Authorization: Bearer <key>`. That is impossible from an
+`<img>` tag or a plain link, which is why opening a media URL directly looked
+broken. The service therefore also accepts **`?key=<secret>`**:
+
+```
+/media/<uuid>?key=<secret>        renders in a browser, downloadable
+```
+
+Same key, same validation; the query form exists purely so the UI and plain
+links work. Prefer the header from servers (query strings can land in logs).
+
 ## Watermark
 
 Every render carries Google's **visible 4-pointed sparkle**, alpha-composited

@@ -1228,6 +1228,22 @@ class FlowAPI:
                 print(f"[media] short body for {media_uuid}: {len(blob)}B",
                       flush=True)
                 return None
+            # Strip Google's visible sparkle HERE, on the way in, so every image
+            # the API ever serves is clean by construction — including ones
+            # re-fetched from history later. Applied exactly once per original
+            # (the cache short-circuits re-cleaning); the inverse composite is
+            # not idempotent, so double-application would darken the region.
+            try:
+                import dewatermark_server as _dw
+                if _dw.available():
+                    cleaned = _dw.clean_bytes(blob)
+                    if cleaned and cleaned is not blob and cleaned != blob:
+                        print(f"[media] watermark removed from {media_uuid} "
+                              f"({len(blob)} -> {len(cleaned)}B)", flush=True)
+                        blob = cleaned
+            except Exception as _dwe:
+                print(f"[media] dewatermark skipped: {str(_dwe)[:110]}",
+                      flush=True)
             out = self._outputs_dir() / f"{media_uuid}.jpg"
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(blob)
