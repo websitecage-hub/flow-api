@@ -15,6 +15,7 @@ import os
 import queue
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from flow_headless import (HeadlessEngine, detect_headless_shell, load_state,
@@ -33,6 +34,10 @@ MODEL_DISPLAY = {
 }
 CHROME = detect_headless_shell()
 STATE_FILE = ROOT / "sessions" / "flow_api_state.json"
+# The signed flow-content.google URLs are plain-HTTP fetchable; a browser UA
+# keeps the CDN from treating the service's request as a bot.
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
 
 
 def norm_model(name):
@@ -996,6 +1001,15 @@ class FlowAPI:
                 print(f"[generate] session looks dead ({str(err)[:70]}) -> "
                       f"requested heal", flush=True)
             return {"ok": False, "error": err}
+        # Save the bytes now, while the signed URLs are fresh. The free tier
+        # has no persistent disk and those URLs expire, so without this
+        # /media/<uuid> can never serve a freshly generated image.
+        for it in items:
+            u = str(it.get("uuid") or "")
+            if u and it.get("url") and not self._cached_media(u):
+                p = self.save_media_bytes(it.get("url"), u)
+                if p:
+                    it["file"] = str(p)
         return {"ok": True, "media": items, **items[0]}
 
     def submit_generate(self, prompt, model=None, aspect=None, seed=None,
@@ -1180,5 +1194,80 @@ class FlowAPI:
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
-    def media(self, media_uuid):
+    # ── media bytes ───────────────────────────────────────────────
+    def _outputs_dir(self) -> Path:
+        return Path(__file__).parent / "outputs"
+
+    def _cached_media(self, media_uuid):
+        """A previously saved copy of this media, if there is one."""
+        d = self._outputs_dir()
+        for ext in ("jpg", "jpeg", "png", "webp"):
+            p = d / f"{media_uuid}.{ext}"
+            try:
+                if p.exists() and p.stat().st_size > 5000:
+                    return p
+            except Exception:
+                pass
         return None
+
+    def save_media_bytes(self, url, media_uuid):
+        """Download a media URL and cache it as outputs/<uuid>.jpg.
+
+        Verified against a real render: the signed flow-content.google URL is
+        fetchable over plain HTTP with no cookies. Caching it locally is what
+        makes /media/<uuid> work at all, since the free tier has no persistent
+        disk and the signed URLs expire.
+        """
+        if not url or not media_uuid:
+            return None
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                blob = r.read()
+            if len(blob) < 5000:
+                print(f"[media] short body for {media_uuid}: {len(blob)}B",
+                      flush=True)
+                return None
+            out = self._outputs_dir() / f"{media_uuid}.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(blob)
+            print(f"[media] cached {out.name} ({len(blob)}B)", flush=True)
+            return out
+        except Exception as e:
+            print(f"[media] download failed for {media_uuid}: {str(e)[:130]}",
+                  flush=True)
+            return None
+
+    def media(self, media_uuid):
+        """Bytes for a media uuid.
+
+        Disk cache first; otherwise resolve the signed URL from the project
+        history, download it, cache it, and return the path. This used to be a
+        bare `return None`, which made /media/<uuid> always 404 with
+        "download failed" (the reason generated images would not load).
+        """
+        media_uuid = (media_uuid or "").strip()
+        if not media_uuid:
+            return None
+        hit = self._cached_media(media_uuid)
+        if hit:
+            return hit
+
+        def job():
+            try:
+                items = self.engine.history() or []
+            except Exception as e:
+                print(f"[media] history failed: {str(e)[:130]}", flush=True)
+                return None
+            for it in items:
+                u = str(it.get("uuid") or "")
+                if u and (u == media_uuid or u.startswith(media_uuid)):
+                    return self.save_media_bytes(it.get("url"), u)
+            print(f"[media] {media_uuid[:12]} not in history", flush=True)
+            return None
+
+        try:
+            return self.run(job, timeout=240)
+        except Exception as e:
+            print(f"[media] resolve failed: {str(e)[:140]}", flush=True)
+            return None
