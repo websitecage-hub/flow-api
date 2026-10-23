@@ -256,6 +256,42 @@ _reqs = (Path(__file__).resolve().parent.parent /
          "requirements.docker.txt").read_text(encoding="utf-8")
 check("image installs Pillow", "Pillow" in _reqs)
 
+# ── 9. busy accounting (the "always busy" bug) ──────────────────────────────
+# The supervisor's liveness probe occupies the worker for its full timeout. It
+# used to count toward is_busy(), so a slow/wedged probe advertised
+# "a generation is already running" continuously — the service looked stuck.
+import queue as _queue  # noqa: E402
+import threading as _threading  # noqa: E402
+
+_b = F.FlowAPI.__new__(F.FlowAPI)
+_b._counter_lock = _threading.Lock()
+_b._active = 0
+_b._internal_active = 0
+_b._q = _queue.Queue()
+check("idle => not busy", _b.is_busy() is False)
+_b._active = 1
+_b._internal_active = 1
+check("an internal probe alone does NOT report busy", _b.is_busy() is False)
+_b._active = 2
+check("a user job alongside a probe IS busy", _b.is_busy() is True)
+_b._active = 1
+_b._internal_active = 0
+check("user job alone is busy", _b.is_busy() is True)
+_b._active = 0
+check("back to idle", _b.is_busy() is False)
+_b._q.put("x")
+check("queued work counts as busy", _b.is_busy() is True)
+
+_src2 = inspect.getsource(F.FlowAPI.run)
+check("run() accepts the _internal marker", "_internal" in _src2)
+check("run() tracks internal ops separately",
+      "_internal_active" in _src2)
+_sup = inspect.getsource(F.FlowAPI._supervise)
+check("liveness probe is marked internal",
+      "_internal=True" in _sup)
+check("liveness probe uses a short timeout (25s, not 60s)",
+      "timeout=25" in _sup and "timeout=60" not in _sup)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

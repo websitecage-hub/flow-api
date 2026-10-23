@@ -275,6 +275,11 @@ class FlowAPI:
         self._ready = threading.Event()
         self._counter_lock = threading.Lock()
         self._active = 0
+        # Ops the service runs for itself (liveness probe, session checks).
+        # They occupy the worker but are NOT user work, so they must not make
+        # is_busy() true — a 60s timed-out probe used to advertise "generation
+        # already running" for a minute at a time, in a loop.
+        self._internal_active = 0
         self.local_run = True
         self.boot_error = ""
         self._thread = None
@@ -354,13 +359,17 @@ class FlowAPI:
             print(f"[*] SIGKILLed {killed} stale node driver(s)", flush=True)
         return killed
 
-    def run(self, fn, timeout=600, _boot=False, _rebuild_on_timeout=True):
+    def run(self, fn, timeout=600, _boot=False, _rebuild_on_timeout=True,
+            _internal=False):
         """Enqueue fn on the worker and wait up to `timeout`. NEVER holds a
         lock while waiting — one slow call must not block every other call.
         On timeout the worker is considered wedged: hard-rebuild the engine
         (unless this call IS the boot, or the caller manages recovery itself
         via _rebuild_on_timeout=False — the supervisor counts consecutive
-        liveness failures and applies a cooldown before rebuilding)."""
+        liveness failures and applies a cooldown before rebuilding).
+
+        `_internal=True` marks service-owned work (the liveness probe) that
+        occupies the worker without being a user job."""
         if not self._ready.is_set():
             raise RuntimeError("engine not started")
         if self._thread is None or not self._thread.is_alive():
@@ -370,6 +379,8 @@ class FlowAPI:
         self._q.put((fn, ev, res))
         with self._counter_lock:
             self._active += 1
+            if _internal:
+                self._internal_active += 1
         try:
             if not ev.wait(timeout):
                 # TIMEOUT SAFETY: only hard-rebuild when THIS caller is the
@@ -395,14 +406,19 @@ class FlowAPI:
         finally:
             with self._counter_lock:
                 self._active -= 1
+                if _internal:
+                    self._internal_active = max(0, self._internal_active - 1)
 
     def is_busy(self):
-        # ANY in-flight job (>=1) means the worker is occupied — the old
-        # '> 1' treated the running generate itself as "not busy", letting
-        # the supervisor's liveness probe queue behind it, time out, and
-        # hard-rebuild the browser OUT from under the running job.
+        # Any in-flight USER job means the worker is occupied. Service-owned
+        # ops (the liveness probe) are excluded: they run unattended and often,
+        # and counting them made the API answer "a generation is already
+        # running" whenever a probe was merely slow — the symptom that looked
+        # like the service being permanently stuck.
         try:
-            return self._active >= 1 or not self._q.empty()
+            with self._counter_lock:
+                user_active = self._active - self._internal_active
+            return user_active >= 1 or not self._q.empty()
         except Exception:
             return False
 
@@ -663,8 +679,12 @@ class FlowAPI:
                 # so require 2 consecutive misses AND a cooldown before
                 # rebuilding — one blip used to trigger a disruptive rebuild.
                 try:
-                    self.run(lambda: self.engine.page.evaluate("1"), timeout=60,
-                             _rebuild_on_timeout=False)
+                    # 25s, not 60s: a healthy shell answers evaluate("1") in
+                    # milliseconds even on 0.1 CPU, so anything slower is a
+                    # wedge — and the old 60s held the worker for a full minute
+                    # per attempt. _internal=True keeps it out of is_busy().
+                    self.run(lambda: self.engine.page.evaluate("1"), timeout=25,
+                             _rebuild_on_timeout=False, _internal=True)
                     liveness_fails = 0
                 except Exception as e:
                     liveness_fails += 1
