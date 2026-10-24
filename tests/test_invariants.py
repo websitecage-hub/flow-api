@@ -289,8 +289,15 @@ check("run() tracks internal ops separately",
 _sup = inspect.getsource(F.FlowAPI._supervise)
 check("liveness probe is marked internal",
       "_internal=True" in _sup)
-check("liveness probe uses a short timeout (25s, not 60s)",
-      "timeout=25" in _sup and "timeout=60" not in _sup)
+check("liveness has a renderer-free first tier (process count)",
+      "_count_browser_procs" in _sup and
+      hasattr(F.FlowAPI, "_count_browser_procs"))
+check("a stuck renderer gets a SOFT reload before a full rebuild",
+      "goto_app" in _sup and "soft reload" in _sup)
+check("probe timeout is a middle bound (45s), not the 25s panic value",
+      "timeout=45" in _sup and "timeout=25" not in _sup)
+check("probe failure is diagnosed, not guessed at",
+      "procs=" in _sup and "fails=" in _sup)
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

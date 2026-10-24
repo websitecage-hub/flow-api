@@ -340,6 +340,26 @@ class FlowAPI:
             print(f"[*] SIGKILLed {killed} stray browser process(es)", flush=True)
         return killed
 
+    def _count_browser_procs(self):
+        """How many chrome-headless-shell processes hold our profile.
+
+        This is the cheap, renderer-free liveness signal: if processes exist,
+        the browser is up even when a page is too busy to answer CDP. It tells
+        a dead browser apart from a merely stuck renderer — the distinction the
+        rebuild loop was missing (it rebuilt forever when booting was never the
+        problem)."""
+        n = 0
+        for p in glob.glob("/proc/[0-9]*"):
+            try:
+                cmd = open(p + "/cmdline", "rb").read().replace(
+                    b"\0", b" ").decode("utf-8", "replace")
+                if (("chrome-headless-shell" in cmd or "headless_shell" in cmd)
+                        and str(PROFILE) in cmd):
+                    n += 1
+            except Exception:
+                pass
+        return n
+
     def _kill_driver_procs(self):
         """SIGKILL playwright node drivers that belong to dead engines.
         Each leaked driver costs ~120MB — fatal on 512MB free tier."""
@@ -678,27 +698,74 @@ class FlowAPI:
                 # A single timeout is usually just a busy renderer on 0.1 CPU,
                 # so require 2 consecutive misses AND a cooldown before
                 # rebuilding — one blip used to trigger a disruptive rebuild.
+                # ── liveness, in tiers ────────────────────────────────
+                # Tier 1 is renderer-free: does the browser PROCESS exist?
+                # Asking the page cannot tell a busy browser from a dead one,
+                # and rebuilding a busy-but-alive browser is exactly what
+                # produced the endless rebuild storm (boot was never broken —
+                # the log showed a clean boot every time, then a probe that
+                # could not be answered).
                 try:
-                    # 25s, not 60s: a healthy shell answers evaluate("1") in
-                    # milliseconds even on 0.1 CPU, so anything slower is a
-                    # wedge — and the old 60s held the worker for a full minute
-                    # per attempt. _internal=True keeps it out of is_busy().
-                    self.run(lambda: self.engine.page.evaluate("1"), timeout=25,
-                             _rebuild_on_timeout=False, _internal=True)
+                    procs = self._count_browser_procs()
+                except Exception:
+                    procs = -1
+                if procs == 0:
+                    print("[supervisor] no browser process at all -> rebuild",
+                          flush=True)
+                    last_rebuild = time.time()
+                    liveness_fails = 0
+                    self.hard_rebuild(boot=True)
+                    continue
+
+                # Tier 2: ask the page. 45s — a healthy shell answers in
+                # milliseconds, but this is a 0.1-CPU box and a just-loaded
+                # Flow page runs a lot of JS; too tight a bound here causes
+                # false wedges.
+                probe_failed = False
+                try:
+                    self.run(lambda: self.engine.page.evaluate("1"),
+                             timeout=45, _rebuild_on_timeout=False,
+                             _internal=True)
                     liveness_fails = 0
                 except Exception as e:
+                    probe_failed = True
                     liveness_fails += 1
+                    try:
+                        rss_now = self._cached_rss()[0]
+                    except Exception:
+                        rss_now = -1
+                    print(f"[supervisor] page probe failed ({str(e)[:60]}) — "
+                          f"procs={procs} rss={rss_now} fails={liveness_fails}",
+                          flush=True)
+
+                if probe_failed:
+                    # Tier 3: SOFT recovery — reload the app rather than kill
+                    # the browser. A stuck renderer is usually just this page,
+                    # and a reload costs ~10s against a rebuild's ~2min + the
+                    # loss of a warm reCAPTCHA.
+                    try:
+                        self.run(lambda: self.engine.goto_app("/"),
+                                 timeout=90, _rebuild_on_timeout=False,
+                                 _internal=True)
+                        print("[supervisor] soft reload recovered the page",
+                              flush=True)
+                        liveness_fails = 0
+                        probe_failed = False
+                    except Exception as e:
+                        print(f"[supervisor] soft reload failed too: "
+                              f"{str(e)[:80]}", flush=True)
+                if probe_failed:
                     since = time.time() - last_rebuild
                     if liveness_fails >= 2 and since > 300:
                         print(f"[supervisor] liveness failed x{liveness_fails} "
-                              f"({str(e)[:70]}) -> rebuild", flush=True)
+                              f"-> rebuild", flush=True)
                         last_rebuild = time.time()
                         liveness_fails = 0
                         self.hard_rebuild(boot=True)
                     else:
-                        print(f"[supervisor] liveness failed "
-                              f"({str(e)[:70]}) — attempt {liveness_fails}, "
-                              f"waiting (backoff)", flush=True)
+                        print(f"[supervisor] liveness still failing — attempt "
+                              f"{liveness_fails}, waiting (backoff)",
+                              flush=True)
                     continue
                 # login check every ~10 min; a failure here re-mints rather
                 # than re-seeding the same (possibly stale) cookies
