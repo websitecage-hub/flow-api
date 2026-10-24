@@ -1204,6 +1204,39 @@ class HeadlessEngine:
             pass
         return out
 
+    def ensure_project(self, project_id=None):
+        """The project to work in: the stored one, else the NEWEST existing
+        one, else a newly created one.
+
+        The state file lives inside the container, so it is empty after every
+        deploy. Creating a project in that case gave the account a fresh
+        project per deploy and scattered one's work across them; reusing the
+        newest existing project is what a user expects, and only falls back to
+        creating one when the account genuinely has none.
+        """
+        pid = project_id or load_state().get("project_id", "")
+        if pid:
+            return pid
+        try:
+            existing = self.projects(limit=1)
+            if existing:
+                pid = str(existing[0].get("project") or "")
+                if pid:
+                    _log(f"[*] no stored project -> reusing newest ({pid[:12]})")
+        except Exception:
+            pid = ""
+        if not pid:
+            _log("[*] no existing project -> creating one")
+            pid = self.create_project()
+        if pid:
+            try:
+                st = load_state()
+                st["project_id"] = pid
+                save_state(st)
+            except Exception:
+                pass
+        return pid
+
     # ── upload / reference images (RPC `maseQ`) ──────────────────
     # Mapped from live traffic (see API.md "Upload / reference images"): the
     # image bytes ride INLINE as base64 inside an ordinary batchexecute POST.
@@ -1254,12 +1287,11 @@ class HeadlessEngine:
         if not filename:
             ext = {"image/png": "png", "image/webp": "webp"}.get(mime, "jpg")
             filename = f"upload-{int(time.time())}.{ext}"
-        pid = project_id or load_state().get("project_id", "")
-        if not pid:
-            pid = self.create_project()
+        pid = self.ensure_project(project_id)
         if not pid:
             self.last_error = "upload: no project id (auto-create failed)"
             return None
+
         # the call must come from the project page: that is where the app
         # issues it (source-path + origin context)
         try:
@@ -1351,18 +1383,7 @@ class HeadlessEngine:
             _log("[*] generate: session check failed — continuing without "
                  "restart (mid-job restart kills the page)")
             self.last_error = ""
-        pid = project_id or load_state().get("project_id", "")
-        if not pid:
-            # auto-create a project so generation "just works" with no id set
-            _log("[*] generate: no project id -> creating a new project")
-            pid = self.create_project()
-            if pid:
-                try:
-                    st = load_state()
-                    st["project_id"] = pid
-                    save_state(st)
-                except Exception:
-                    pass
+        pid = self.ensure_project(project_id)
         if not pid:
             _log("[!] generate: no project id")
             return None

@@ -562,16 +562,36 @@ class Page:
 
     # -- js -----------------------------------------------------
     def evaluate(self, expression: str, arg: Any = None, timeout: float = 60):
-        expr = expression
-        if arg is not None:
-            # Playwright-style "call this function with an argument".
-            # Assign to a const first: `typeof async ({a}) => {}` is a
-            # SyntaxError (typeof binds to `async`), which silently broke
-            # every engine RPC. A const assignment parses for arrows, async
-            # arrows and plain expressions alike.
-            expr = ("((__a) => { const __f = (" + expression + ");"
-                    " return (typeof __f === 'function') ? __f(__a) : __f; })"
-                    "(" + json.dumps(arg) + ")")
+        # ALWAYS wrap and invoke — never pass the expression to Runtime.evaluate
+        # bare.
+        #
+        # Callers write either a plain expression ("1", "document.title") or an
+        # arrow function ("() => {...}"). An arrow sent straight to
+        # Runtime.evaluate is NOT called: it evaluates to a function OBJECT, and
+        # with returnByValue:true a function serialises to {} — an empty, falsy
+        # result that looks like "the page had nothing to say".
+        #
+        # That one flaw silently broke every no-argument call site:
+        #   * at_token() scraped JS_SCRAPE_AT (an arrow) -> {} -> "" , so the
+        #     page's `at` token was NEVER read; every RPC depended on luckily
+        #     capturing the app's own token from its traffic, and failed with
+        #     "no at token" when it had not seen one yet.
+        #   * wait_for_function() could never become true, so the composer wait
+        #     burned its entire timeout (120s) before the separate count() check
+        #     decided — that is the "it took a long time" complaint.
+        #   * the page probe / fingerprint self-test returned {} and passed
+        #     vacuously.
+        #
+        # Assign to a const first: `typeof async ({a}) => {}` is a SyntaxError
+        # (typeof binds to `async`), which silently broke every engine RPC. A
+        # const assignment parses for arrows, async arrows and plain
+        # expressions alike.
+        src = str(expression).strip()
+        while src.endswith(";"):
+            src = src[:-1].rstrip()
+        expr = ("((__a) => { const __f = (" + src + ");"
+                " return (typeof __f === 'function') ? __f(__a) : __f; })"
+                "(" + json.dumps(arg) + ")")
         r = self._send("Runtime.evaluate",
                        {"expression": expr, "returnByValue": True,
                         "awaitPromise": True, "userGesture": True},

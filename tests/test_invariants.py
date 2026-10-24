@@ -488,11 +488,77 @@ check("the failure message carries the page URL for diagnosis",
       "page={url" in _gen_src or "page=" in _gen_src)
 
 _diag_src = inspect.getsource(F.FlowAPI.diag)
+check("composer-missing recovery is cheaper than a session heal",
+      "reloading the app once" in _gen_src)
+check("engine exposes ensure_project()",
+      hasattr(FH.HeadlessEngine, "ensure_project"))
+_ep_src = inspect.getsource(FH.HeadlessEngine.ensure_project)
+check("ensure_project reuses the newest existing project before creating one",
+      "self.projects(limit=1)" in _ep_src
+      and _ep_src.index("self.projects(limit=1)")
+      < _ep_src.index("self.create_project()"))
+check("ensure_project respects an explicit project id",
+      "project_id or load_state()" in _ep_src)
+check("generate uses ensure_project (not a blind create)",
+      "self.ensure_project" in _gen_src
+      and "no project id -> creating a new project" not in _gen_src)
+check("upload uses ensure_project too",
+      "self.ensure_project" in inspect.getsource(FH.HeadlessEngine.upload_image))
 check("/diag runs as an internal op (so it can report at all)",
       "_internal=True" in _diag_src)
 check("/diag no longer uses the plain 150s dispatch",
       "timeout=150)" not in _diag_src)
 check("/diag reports the page state", "page_probe" in _diag_src)
+
+# ── 15. evaluate() must INVOKE an arrow function, not return it ─────────────
+# The root cause of "no `at` token" and of the composer wait burning its whole
+# timeout: an arrow passed to Runtime.evaluate without an argument evaluates to
+# a function OBJECT, and returnByValue serialises that to {} — empty and falsy.
+# The wrapper was only applied when an argument was supplied.
+print("\n[15] CDP evaluate() invocation")
+check("_is_idle_timeout still classifies properly",
+      _CDP._is_idle_timeout(TimeoutError("timed out")) is True)
+
+
+class _FakeConn:
+    """Captures the expression that would be sent to Runtime.evaluate."""
+
+    def __init__(self):
+        self.params = None
+
+    def send(self, method, params=None, session_id=None, timeout=30,
+             wait=True):
+        self.params = params or {}
+        return {"result": {"value": "STUB"}}
+
+
+_pg = _CDP.Page(_FakeConn(), "sid")
+_pg.evaluate("() => 2")
+_e1 = _pg._conn.params.get("expression", "")
+check("a NO-ARG arrow is wrapped and invoked", "__f(__a)" in _e1,
+      _e1[:90])
+check("...with null as the argument", "(null)" in _e1)
+check("...inside a typeof-function guard", "typeof __f === 'function'" in _e1)
+
+_pg.evaluate("1")
+_e2 = _pg._conn.params.get("expression", "")
+check("a plain expression is still wrapped (harmless)", "const __f = (1)" in _e2,
+      _e2[:90])
+
+_pg.evaluate("(n) => n * 3", 5)
+_e3 = _pg._conn.params.get("expression", "")
+check("an explicit argument is passed through", "JSON".replace("JSON", "(5)")
+      in _e3 or "(5)" in _e3, _e3[:90])
+
+_pg.evaluate("() => 9;")
+_e4 = _pg._conn.params.get("expression", "")
+check("a trailing semicolon is stripped (it would be a syntax error)",
+      "() => 9;" not in _e4 and "() => 9" in _e4, _e4[:90])
+
+_ev_src = inspect.getsource(_CDP.Page.evaluate)
+check("the wrapper is unconditional (no `if arg is not None` gate)",
+      "if arg is not None" not in _ev_src)
+check("None serialises to null in the call", "json.dumps(arg)" in _ev_src)
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
