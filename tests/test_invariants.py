@@ -391,7 +391,23 @@ check("explicit aliases still resolve (pro)",
       F.norm_model("NANO BANANA PRO") == "GEM_PIX_2")
 _ls_src = inspect.getsource(FH.load_state)
 check("stored default model is not the deprecated NARWHAL",
-      "DEFAULT_MODEL" in _ls_src and '"NARWHAL"' not in _ls_src)
+      'get("FLOW_MODEL", DEFAULT_MODEL)' in _ls_src)
+check("stale NARWHAL state migrates forward to the default",
+      'st["model"] = DEFAULT_MODEL' in _ls_src)
+# the migration itself, against a synthetic state file
+_orig_state = FH.STATE_FILE
+with tempfile.TemporaryDirectory() as _sd:
+    FH.STATE_FILE = Path(_sd) / "flow_api_state.json"
+    FH.STATE_FILE.write_text('{"project_id": "p", "model": "NARWHAL"}',
+                             encoding="utf-8")
+    check("load_state rewrites a deprecated stored model",
+          FH.load_state().get("model") == FH.DEFAULT_MODEL,
+          str(FH.load_state().get("model")))
+    FH.STATE_FILE.write_text('{"project_id": "p", "model": "GEM_PIX_2"}',
+                             encoding="utf-8")
+    check("load_state leaves a valid stored model alone",
+          FH.load_state().get("model") == "GEM_PIX_2")
+FH.STATE_FILE = _orig_state
 
 # ── 13. upload (RPC maseQ) ──────────────────────────────────────────────────
 # The wire shape is the one thing that cannot be re-derived by guessing, so it

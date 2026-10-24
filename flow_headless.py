@@ -333,6 +333,13 @@ def load_state() -> dict:
     st.setdefault("project_id", os.environ.get("FLOW_PROJECT", ""))
     # Default to the CURRENT model, not the deprecated NARWHAL (see norm_model).
     st.setdefault("model", os.environ.get("FLOW_MODEL", DEFAULT_MODEL))
+    # MIGRATION: a state file written before DEFAULT_MODEL existed still says
+    # NARWHAL (Nano Banana 2), which is deprecated and shuts down 2026-10-29.
+    # Left alone it shows up on /health and in GET /models as if it were the
+    # active model, so the dashboard reads as if generation were pinned to a
+    # retiring model. Move stale state forward.
+    if str(st.get("model") or "").upper() in ("NARWHAL", "NANO BANANA 2"):
+        st["model"] = DEFAULT_MODEL
     return st
 
 
