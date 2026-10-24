@@ -299,6 +299,44 @@ check("probe timeout is a middle bound (45s), not the 25s panic value",
 check("probe failure is diagnosed, not guessed at",
       "procs=" in _sup and "fails=" in _sup)
 
+# ── 10. CDP socket death must not be silent ─────────────────────────────────
+# The wedge: the websocket dropped, the reader thread simply exited, and from
+# then on every CDP call waited its full timeout forever while the browser
+# process stayed alive (logs showed procs=1 and even Page.navigate timing out).
+import flow_cdp as _CDP  # noqa: E402
+
+_c = _CDP._Conn.__new__(_CDP._Conn)          # no socket needed
+_c._lock = _threading.Lock()
+_c._pending = {}
+_c._next_id = 1
+_c._closed = False
+_waiter = _threading.Event()
+_c._pending[42] = {"ev": _waiter, "result": None, "error": None}
+check("fresh connection is not dead", _c.dead is False)
+
+_c._fail_all("socket closed (test)")
+check("failed connection reports dead", _c.dead is True)
+check("in-flight waiter released IMMEDIATELY (no timeout burn)",
+      _waiter.is_set())
+check("pending table drained", _c._pending == {})
+check("_fail_all is idempotent", (_c._fail_all("again"), _c.dead)[1] is True)
+
+try:
+    _c.send("Runtime.evaluate", {"expression": "1"})
+    _fast = False
+except Exception as _e:
+    _fast = "closed" in str(_e).lower()
+check("send() fails fast once the socket is dead", _fast)
+
+_rdr = inspect.getsource(_CDP._Conn._reader)
+check("reader reports socket death instead of exiting silently",
+      "_fail_all" in _rdr)
+_snd = inspect.getsource(_CDP._Conn.send)
+check("send() guards against a closed connection", "_closed" in _snd)
+_sup2 = inspect.getsource(F.FlowAPI._supervise)
+check("supervisor fails over on a dead CDP connection",
+      "dead" in _sup2 and "CDP connection is dead" in _sup2)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

@@ -709,6 +709,23 @@ class FlowAPI:
                     procs = self._count_browser_procs()
                 except Exception:
                     procs = -1
+                # A dead CDP socket is a hard failure even though the process
+                # is still there — nothing can be asked of it. Detect it and
+                # rebuild at once rather than burning the probe (45s) and the
+                # soft reload (90s) on calls that can never be answered.
+                dead_conn = False
+                try:
+                    _c = getattr(getattr(self.engine, "page", None), "_conn", None)
+                    dead_conn = bool(_c is not None and _c.dead)
+                except Exception:
+                    dead_conn = False
+                if dead_conn:
+                    print("[supervisor] CDP connection is dead -> rebuild",
+                          flush=True)
+                    last_rebuild = time.time()
+                    liveness_fails = 0
+                    self.hard_rebuild(boot=True)
+                    continue
                 if procs == 0:
                     print("[supervisor] no browser process at all -> rebuild",
                           flush=True)

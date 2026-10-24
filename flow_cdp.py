@@ -68,7 +68,14 @@ class _Conn:
         while not self._closed:
             try:
                 raw = self._ws.recv()
-            except Exception:
+            except Exception as e:
+                # A dropped socket must NOT be a silent death. Without this the
+                # reader just exits: no reply is ever routed again, so every
+                # later command blocks for its full timeout while the browser
+                # process keeps running. That is the observed "wedge" —
+                # procs=1, browser alive, every CDP call (even Page.navigate,
+                # which the browser itself handles) timing out forever.
+                self._fail_all(f"cdp socket closed ({str(e)[:70]})")
                 break
             if not raw:
                 continue
@@ -104,6 +111,31 @@ class _Conn:
                 except Exception:
                     pass
 
+    def _fail_all(self, why: str):
+        """Mark the connection dead and release every waiter NOW.
+
+        Releasing the waiters is the point: otherwise each in-flight and future
+        call runs out its full timeout while nothing will ever answer it.
+        Callers then get an immediate, accurate error and can fail over."""
+        if self._closed:
+            return
+        self._closed = True
+        print(f"[cdp] {why} — connection marked dead", flush=True)
+        with self._lock:
+            pend = list(self._pending.values())
+            self._pending.clear()
+        for slot in pend:
+            slot["error"] = {"message": why}
+            try:
+                slot["ev"].set()
+            except Exception:
+                pass
+
+    @property
+    def dead(self) -> bool:
+        """True once the socket has failed. Cheap enough to poll."""
+        return bool(self._closed)
+
     # -- api ----------------------------------------------------
     def on(self, method: str, handler: Callable):
         with self._hlock:
@@ -118,6 +150,10 @@ class _Conn:
     def send(self, method: str, params: Optional[dict] = None,
              session_id: Optional[str] = None, timeout: float = 30.0,
              wait: bool = True):
+        if self._closed:
+            # Fail fast: waiting the full timeout on a dead socket is wasted
+            # time that delays failover (45s probe + 90s reload, repeatedly).
+            raise CdpError(f"{method}: cdp connection is closed")
         with self._lock:
             mid = self._next_id
             self._next_id += 1
