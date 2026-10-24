@@ -337,6 +337,109 @@ _sup2 = inspect.getsource(F.FlowAPI._supervise)
 check("supervisor fails over on a dead CDP connection",
       "dead" in _sup2 and "CDP connection is dead" in _sup2)
 
+# ── 11. an idle read timeout is NOT a dead socket ───────────────────────────
+# The rebuild loop: the websocket has a read timeout, CDP is silent between
+# commands, so recv() raised TimeoutError("Connection timed out") on a healthy
+# connection. The reader treated that as death -> the supervisor rebuilt the
+# browser every ~90s, killing whatever generation was in flight.
+print("\n[11] CDP idle timeout vs real socket death")
+check("TimeoutError reads as an idle timeout", _CDP._is_idle_timeout(
+    TimeoutError("Connection timed out")) is True)
+check("socket.timeout reads as an idle timeout", _CDP._is_idle_timeout(
+    _CDP.socket.timeout("timed out")) is True)
+
+
+class _WSExc(Exception):
+    pass
+
+
+_WSExc.__name__ = "WebSocketTimeoutException"
+check("websocket-client's timeout exception counts as idle",
+      _CDP._is_idle_timeout(_WSExc("Connection timed out")) is True)
+check("a closed connection is NOT an idle timeout", _CDP._is_idle_timeout(
+    ConnectionResetError("Connection reset by peer")) is False)
+check("'remote host was lost' is NOT an idle timeout", _CDP._is_idle_timeout(
+    Exception("Connection to remote host was lost.")) is False)
+check("'socket closed' is NOT an idle timeout", _CDP._is_idle_timeout(
+    Exception("socket closed")) is False)
+
+_rdr2 = inspect.getsource(_CDP._Conn._reader)
+check("reader ignores idle timeouts instead of failing the connection",
+      "_is_idle_timeout" in _rdr2 and "continue" in _rdr2)
+check("reader still marks a genuinely closed socket dead",
+      "_fail_all" in _rdr2)
+check("an empty frame is treated as a close (no hot spin)",
+      "empty frame" in _rdr2)
+
+# ── 12. model defaults ──────────────────────────────────────────────────────
+# An omitted model used to resolve to NARWHAL — deprecated, shuts down
+# 2026-10-29 — instead of the current default.
+print("\n[12] model resolution defaults to the CURRENT model")
+check("flow_headless: no model -> DEFAULT_MODEL",
+      FH.norm_model(None) == FH.DEFAULT_MODEL, FH.norm_model(None))
+check("flow_headless: empty string -> DEFAULT_MODEL",
+      FH.norm_model("") == FH.DEFAULT_MODEL)
+check("facade: no model -> BELUGA", F.norm_model(None) == "BELUGA",
+      F.norm_model(None))
+check("facade: 'NANO BANANA 2.1' maps to BELUGA (not NARWHAL)",
+      F.norm_model("NANO BANANA 2.1") == "BELUGA",
+      F.norm_model("NANO BANANA 2.1"))
+check("facade: 'BELUGA' passes through", F.norm_model("BELUGA") == "BELUGA")
+check("facade: explicit NARWHAL still honoured for back-compat",
+      F.norm_model("NANO BANANA 2") == "NARWHAL")
+check("explicit aliases still resolve (pro)",
+      F.norm_model("NANO BANANA PRO") == "GEM_PIX_2")
+_ls_src = inspect.getsource(FH.load_state)
+check("stored default model is not the deprecated NARWHAL",
+      "DEFAULT_MODEL" in _ls_src and '"NARWHAL"' not in _ls_src)
+
+# ── 13. upload (RPC maseQ) ──────────────────────────────────────────────────
+# The wire shape is the one thing that cannot be re-derived by guessing, so it
+# is pinned here against the captured payload (API.md "Upload / reference
+# images").
+print("\n[13] upload: maseQ payload + /upload surface")
+_p = FH.build_upload_payload("PROJ-UUID", "BASE64DATA", mime="image/jpeg",
+                             filename="probe_upload.jpg",
+                             uuid_a="AAA", uuid_b="BBB")
+check("payload is a 12-element list", isinstance(_p, list) and len(_p) == 12,
+      str(len(_p)))
+check("head[5] carries the project id",
+      isinstance(_p[0], list) and _p[0][5] == "PROJ-UUID")
+check("head[1] is the literal 22",
+      isinstance(_p[0], list) and _p[0][1] == 22)
+check("base64 rides at [1]", _p[1] == "BASE64DATA")
+check("mime rides at [2]", _p[2] == "image/jpeg")
+check("the marker 1 is at [3]", _p[3] == 1)
+check("filename rides at [8]", _p[8] == "probe_upload.jpg")
+check("two uuids ride at [10]/[11]", _p[10] == "AAA" and _p[11] == "BBB")
+check("head is 10 long without a token", len(_p[0]) == 10)
+_p2 = FH.build_upload_payload("P", "B", token="TOK", uuid_a="A", uuid_b="B")
+check("supplying a token appends [tok, 1] at head[10]",
+      _p2[0][10] == ["TOK", 1] and len(_p2[0]) == 11)
+
+check("engine exposes upload_image", hasattr(FH.HeadlessEngine, "upload_image"))
+_up_src = inspect.getsource(FH.HeadlessEngine.upload_image)
+check("upload uses the in-page transport (maseQ), not pure HTTP",
+      '"maseQ"' in _up_src and "self.call" in _up_src)
+check("upload gives the fetch a large deadline",
+      "timeout_ms=180000" in _up_src)
+check("upload sniffs jpeg/png/webp when no mime is given",
+      b"\\xff\\xd8\\xff".decode("latin1") in _up_src or "image/png" in _up_src)
+check("facade exposes upload()", hasattr(F.FlowAPI, "upload"))
+check("facade upload is bounded by a timeout",
+      "timeout=420" in inspect.getsource(F.FlowAPI.upload))
+
+_srv2 = (Path(__file__).resolve().parent.parent / "flow_server.py").read_text(
+    encoding="utf-8")
+check("server routes POST /upload", 'p.path == "/upload"' in _srv2)
+check("upload accepts JSON image_base64", "image_base64" in _srv2)
+check("upload accepts raw image bytes (non-JSON body)",
+      "_read_raw" in _srv2 and "b64encode(raw_body)" in _srv2)
+check("upload enforces a size ceiling", "MAX_UPLOAD_MB" in _srv2
+      and "413" in _srv2)
+check("upload is listed in the catalogue",
+      "/upload" in (cat.get("endpoints", {}).get("POST") or []))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

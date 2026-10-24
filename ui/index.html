@@ -120,6 +120,21 @@
   </section>
 
   <section>
+    <h2>Upload a reference image</h2>
+    <div class="row">
+      <input type="file" id="upFile" accept="image/jpeg,image/png,image/webp">
+      <button id="upGo">Upload</button>
+    </div>
+    <p class="note" id="upNote" style="margin:8px 0 0">
+      Sends the image into the project's <b>Uploads</b> as a prompt ingredient
+      (<code>maseQ</code>, bytes inline as base64). Max 4 MB. Honest scope:
+      the <i>upload</i> is wired — using an uploaded image as the input to a
+      generation is not, because that request shape is still unmapped.
+    </p>
+    <div id="upOut"></div>
+  </section>
+
+  <section>
     <h2>Endpoints</h2>
     <div class="row" id="quick"></div>
     <pre id="out">Pick an endpoint…</pre>
@@ -139,8 +154,9 @@
     <p class="note">
       • Passing an API key: programs send <code>Authorization: Bearer &lt;key&gt;</code>;
       this page also uses <code>?key=</code> so images render in a browser.<br>
-      • Upload / reference images: wire format captured (<code>maseQ</code>) but the
-      endpoint is not implemented yet.<br>
+      • Upload / reference images: <code>POST /upload</code> is live
+      (<code>maseQ</code>, inline base64). The <i>upload</i> works; feeding an
+      uploaded image into a generation is still unmapped.<br>
       • Google's sparkle watermark is stripped server-side at generation time.<br>
       • Free tier: one generation at a time, and the service sleeps only if
       <code>/health</code> stops being polled.
@@ -220,9 +236,20 @@ $('#go').onclick = async () => {
   }
   const job = sub.body.job;
   $('#genNote').textContent = `job ${job} running…`;
+  const MAX_WAIT_S = 900;
   let t0 = Date.now(), done = false;
   while (!done) {
     await new Promise(r => setTimeout(r, 4000));
+    // Cap the wait. Without this the loop spins forever if a job never
+    // resolves (engine rebuilding under it, or the worker wedged) and the
+    // page just looks hung with no way out but a reload.
+    if ((Date.now() - t0) / 1000 > MAX_WAIT_S) {
+      $('#prog').style.width = '100%';
+      $('#genNote').textContent =
+        `still running after ${Math.round(MAX_WAIT_S / 60)} min — the engine ` +
+        `may be rebuilding. Check /health, then hit Generate again.`;
+      break;
+    }
     const j = await api('/jobs/' + job);
     const jb = j.body.job || j.body || {};
     const st = jb.status;
@@ -264,6 +291,42 @@ function renderGallery(media) {
     g.prepend(d);
   });
 }
+
+/* ── upload a reference image ───────────────────────────────────── */
+const MAX_MB = 4;
+$('#upGo').onclick = async () => {
+  const f = $('#upFile').files && $('#upFile').files[0];
+  if (!f) { $('#upNote').textContent = 'pick an image file first.'; return; }
+  if (f.size > MAX_MB * 1024 * 1024) {
+    $('#upNote').textContent = `too large: ${(f.size / 1048576).toFixed(1)} MB (max ${MAX_MB} MB)`;
+    return;
+  }
+  const btn = $('#upGo'); btn.disabled = true;
+  $('#upNote').textContent = `reading ${f.name}…`;
+  const b64 = await new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(String(fr.result).split(',')[1] || '');
+    fr.onerror = rej;
+    fr.readAsDataURL(f);
+  });
+  $('#upNote').textContent = `uploading ${(f.size / 1024).toFixed(0)} KB…`;
+  const send = () => api('/upload', {method: 'POST', body: JSON.stringify({
+    image_base64: b64, filename: f.name, mime: f.type || 'image/jpeg'})});
+  let r = await send();
+  if (r.status === 429) {
+    const wait = parseInt(r.retry || '30', 10);
+    $('#upNote').textContent = `busy — retrying in ${wait}s`;
+    await new Promise(x => setTimeout(x, wait * 1000));
+    r = await send();
+  }
+  const b = r.body || {};
+  $('#upNote').textContent = b.ok
+    ? `uploaded — media ${(b.media_uuid || '').slice(0, 12) || '(no uuid returned)'}`
+    : 'upload failed: ' + JSON.stringify(b).slice(0, 200);
+  $('#upOut').innerHTML = '<pre>' +
+    esc(JSON.stringify(b, null, 2).slice(0, 3000)) + '</pre>';
+  btn.disabled = false;
+};
 
 /* ── endpoint explorer ──────────────────────────────────────────── */
 const EPS = [['/health','GET'],['/diag','GET'],['/models','GET'],['/credits','GET'],

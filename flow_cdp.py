@@ -40,6 +40,33 @@ class CdpError(RuntimeError):
     pass
 
 
+# Exceptions that mean "no message arrived within the read timeout" — NOT that
+# the connection is broken. websocket-client raises its own class with the
+# message "Connection timed out"; sockets raise TimeoutError/socket.timeout.
+_IDLE_TIMEOUT_NAMES = ("WebSocketTimeoutException", "TimeoutError",
+                       "timeout")
+
+
+def _is_idle_timeout(exc: BaseException) -> bool:
+    """True for a read-timeout (connection is fine), False for a real close.
+
+    Distinguishing these matters: a healthy CDP connection is silent between
+    commands, so a timeout fires on idle connections constantly. Treating it
+    as a failure rebuilt the browser every ~90s and killed live jobs.
+    """
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    name = type(exc).__name__
+    if name in _IDLE_TIMEOUT_NAMES:
+        return True
+    # Last resort: match on the message, but ONLY when it does not describe a
+    # closed/lost connection (those must stay fatal).
+    msg = str(exc).lower()
+    if "closed" in msg or "lost" in msg or "reset" in msg or "broken" in msg:
+        return False
+    return "timed out" in msg or "timeout" in msg
+
+
 # ────────────────────────────────────────────────────────────────
 # transport: one WebSocket, a reader thread, id-correlated requests
 # ────────────────────────────────────────────────────────────────
@@ -69,6 +96,24 @@ class _Conn:
             try:
                 raw = self._ws.recv()
             except Exception as e:
+                # IDLE TIMEOUT IS NOT DEATH. The websocket has a read timeout
+                # (see __init__). CDP is SILENT between commands: no traffic
+                # flows while we wait for a job, so recv() raises
+                # TimeoutError("Connection timed out") on a perfectly healthy
+                # connection every `timeout` seconds.
+                #
+                # Treating that as a failure marked the socket dead and made
+                # the supervisor rebuild the browser every ~90s — killing
+                # whatever generation was in flight. That was the real cause
+                # of the constant rebuild loop and of "generation sometimes
+                # just fails".
+                #
+                # A genuinely dropped socket raises a *closed* error, which
+                # still falls through to _fail_all below. A wedged (but
+                # connected) browser is caught by the per-call timeouts in
+                # send(), not here.
+                if _is_idle_timeout(e):
+                    continue
                 # A dropped socket must NOT be a silent death. Without this the
                 # reader just exits: no reply is ever routed again, so every
                 # later command blocks for its full timeout while the browser
@@ -78,7 +123,10 @@ class _Conn:
                 self._fail_all(f"cdp socket closed ({str(e)[:70]})")
                 break
             if not raw:
-                continue
+                # An empty frame from the remote = the socket is gone. Looping
+                # on it would spin hot forever, so treat it as a close.
+                self._fail_all("cdp socket closed (empty frame)")
+                break
             try:
                 msg = json.loads(raw)
             except Exception:

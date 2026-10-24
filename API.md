@@ -74,6 +74,7 @@ POST /upscale  {"mediaUuid": "<uuid>", "resolution": "2K" | "4K"}
 | `GET /project/new` | create a project (`jHPbke`) |
 | `GET /history` | media for the active project (`Zzl0ze`), falls back to a local cache |
 | `GET /media/<uuid>` | download the image bytes |
+| `POST /upload` | ⬆ upload a reference image (`maseQ`) — see the upload section |
 | `GET /media/<uuid>?info=1` | ⚠️ **experimental, disabled** — `as29s` returned nothing and wedged the page; gated behind `FLOW_EXPERIMENTAL=1` |
 
 **Why the two are off:** both returned no data *and* left the renderer stuck for
@@ -188,10 +189,48 @@ Field positions verified from the capture: project id at `[0][5]`, mime at
 the first element is the literal `22`; the 2553-char token at `[0][10][0]` is
 still unidentified in origin (may or may not be required).
 
-**Implementation note:** the upload should be issued from inside the page
+**Implementation note:** the upload is issued from inside the page
 (`JS_RPC`-style fetch), the same way every other RPC in this service works.
 Do **not** build it on pure-HTTP batchexecute — see the transport finding
 below; that path is currently unverified.
+
+### `POST /upload` — implemented
+
+Two body forms are accepted:
+
+```
+# 1. JSON (base64) — what the console UI sends
+curl -X POST https://flow-api-a9ei.onrender.com/upload \
+  -H "Authorization: Bearer <secret>" -H 'Content-Type: application/json' \
+  -d '{"image_base64":"<base64>","filename":"ref.jpg","mime":"image/jpeg"}'
+
+# 2. raw bytes — no base64 step
+curl -X POST "https://flow-api-a9ei.onrender.com/upload?filename=ref.jpg" \
+  -H "Authorization: Bearer <secret>" -H 'Content-Type: image/jpeg' \
+  --data-binary @ref.jpg
+```
+
+```
+-> 200 {"ok": true, "media_uuid": "<uuid>", "mime": "image/jpeg",
+        "filename": "ref.jpg", "project": "<uuid>", "bytes": 182134,
+        "uuids": [...], "urls": [...]}
+-> 400 {"ok": false, "error": "image required", "hint": "...", "max_mb": 4}
+-> 413 {"ok": false, "error": "image too large (5.2 MB decoded)", "max_mb": 4}
+-> 429 {"ok": false, "error": "a job is already running", "retry_after_s": 30}
+```
+
+`filename` is optional (auto-named from the sniffed type); `projectId`
+defaults to the active project, auto-creating one if unset. The MIME is
+sniffed from the JPEG/PNG/WebP magic when not supplied.
+
+**Scope, stated plainly:** this performs the *upload* — the image lands in the
+project's **Uploads** as a prompt ingredient, exactly as the app's own
+"Upload media" flow does. **Attaching an uploaded image to a generation is not
+wired**: the phase-2 request that references an ingredient was never captured,
+so image-to-image is still impossible through this API. The size ceiling
+(`FLOW_MAX_UPLOAD_MB`, default 4) exists because the bytes are base64'd and
+urlencoded on the way to Google — several times the file size in peak memory,
+on a container shared with the browser.
 
 ### Open issue: pure-HTTP batchexecute returns 400
 

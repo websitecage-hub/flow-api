@@ -77,6 +77,13 @@ JS_HEAP_MB = int(os.environ.get("FLOW_JS_HEAP_MB", "96"))
 # First load right after login is the slowest case (~2 min observed).
 COMPOSER_TIMEOUT = int(os.environ.get("FLOW_COMPOSER_TIMEOUT", "120"))
 
+# How long to wait for the composer's own `ogiZ0b` response after Enter.
+# This used to be a hard-coded 90s, which is hostile on a 0.1-CPU box: the
+# response carries the finished media, so it cannot arrive before Flow has
+# rendered. Timing out early throws away a generation that was about to
+# succeed AND restarts the browser underneath it. Waiting is cheaper.
+RESPONSE_TIMEOUT = int(os.environ.get("FLOW_RESPONSE_TIMEOUT", "240"))
+
 
 def _proxy_config():
     """Optional egress proxy for the browser, from FLOW_PROXY_URL.
@@ -154,13 +161,42 @@ ASPECT_WIRE = {"1:1": 1, "9:16": 2, "16:9": 3, "3:4": 4, "4:3": 5,
 
 
 def norm_model(name):
-    """Human/model name -> wire code. Accepts wire codes unchanged."""
+    """Human/model name -> wire code. Accepts wire codes unchanged.
+
+    An empty name means "whatever the app defaults to" -> DEFAULT_MODEL.
+    This used to return NARWHAL (Nano Banana 2), which is DEPRECATED and
+    shuts down 2026-10-29: callers that omitted `model` were silently asking
+    for a retiring model instead of the current default.
+    """
     if not name:
-        return "NARWHAL"
+        return DEFAULT_MODEL
     k = str(name).strip().upper()
     if k in MODEL_WIRE:
         return k
     return MODEL_DISPLAY.get(k, k.replace(" ", "_"))
+
+
+def build_upload_payload(project_id, b64, mime="image/jpeg", filename="",
+                         token="", uuid_a="", uuid_b=""):
+    """The `maseQ` (upload) request body, exactly as the app sends it.
+
+    Decoded from live traffic (see API.md "Upload / reference images"): the
+    image bytes ride INLINE as base64 inside an ordinary batchexecute POST.
+    Verified positions: project id at [0][5], base64 at [1], mime at [2],
+    filename at [8], two generated uuids at [10]/[11].
+
+    Kept as a module-level function so the wire shape is unit-testable without
+    a browser — this shape is the one thing about upload that cannot be
+    re-derived by guessing.
+    """
+    head = [None, 22, None, None, None, project_id, None, None, None, None]
+    if token:
+        # [0][10][0]: a 2553-char token of unidentified origin (possibly a
+        # reCAPTCHA token for an unknown action). Optional — never observed
+        # proven necessary.
+        head.append([token, 1])
+    return [head, b64, mime, 1, None, None, None, None, filename, None,
+            uuid_a, uuid_b]
 
 
 def _log(msg):
@@ -295,7 +331,8 @@ def load_state() -> dict:
         except Exception:
             pass
     st.setdefault("project_id", os.environ.get("FLOW_PROJECT", ""))
-    st.setdefault("model", os.environ.get("FLOW_MODEL", "NARWHAL"))
+    # Default to the CURRENT model, not the deprecated NARWHAL (see norm_model).
+    st.setdefault("model", os.environ.get("FLOW_MODEL", DEFAULT_MODEL))
     return st
 
 
@@ -382,7 +419,7 @@ JS_MINT = """(site) => new Promise((resolve) => {
   setTimeout(() => fin({ok: false, err: 'mint_timeout'}), 90000);
 })"""
 
-JS_RPC = """async ({rpcid, payload, at, pid, base}) => {
+JS_RPC = """async ({rpcid, payload, at, pid, base, timeoutMs}) => {
   const fReq = JSON.stringify([[[rpcid, JSON.stringify(payload), null, "generic"]]]);
   const body = new URLSearchParams();
   body.set('f.req', fReq);
@@ -400,9 +437,11 @@ JS_RPC = """async ({rpcid, payload, at, pid, base}) => {
   // paused by our own Fetch interception, or a throttled endpoint) hangs the
   // promise forever, and because evaluate() awaits it the CDP call burns its
   // full timeout and looks like a wedged renderer. Failing at 45s turns that
-  // into a normal, diagnosable error.
+  // into a normal, diagnosable error. Callers that legitimately need longer
+  // (an image upload carries megabytes of base64) pass timeoutMs.
   const ctl = new AbortController();
-  const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 45000);
+  const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} },
+                        (timeoutMs || 45000));
   try {
     const url = new URL(u, location.origin);
     url.searchParams.set('rpcids', rpcid);
@@ -996,9 +1035,14 @@ class HeadlessEngine:
             self._at = ""
         return self._at
 
-    def call(self, rpcid: str, payload, project_id: str = ""):
+    def call(self, rpcid: str, payload, project_id: str = "",
+             timeout_ms: int = 0, eval_timeout: float = 60):
         """POST a batchexecute RPC from inside the page. Returns parsed data.
-        Uses the app's captured URL/at when available (copy-the-headers)."""
+        Uses the app's captured URL/at when available (copy-the-headers).
+
+        `timeout_ms` bounds the in-page fetch (default 45s); `eval_timeout`
+        bounds the CDP evaluate that awaits it and must be larger.
+        """
         pid = project_id or load_state().get("project_id", "")
         # A stale `at` shows up as HTTP 401 from batchexecute (not 400). The at
         # lives in page state and goes stale when the app re-inits or the
@@ -1025,8 +1069,8 @@ class HeadlessEngine:
                 return None
             r = self.page.evaluate(JS_RPC, {
                 "rpcid": rpcid, "payload": payload, "at": at, "pid": pid,
-                "base": self._be_base,
-            })
+                "base": self._be_base, "timeoutMs": timeout_ms or 45000,
+            }, timeout=eval_timeout)
             if isinstance(r, dict) and r.get("status") == 200:
                 break
             if (isinstance(r, dict) and r.get("status") in (401, 403)
@@ -1100,6 +1144,116 @@ class HeadlessEngine:
         except Exception:
             pass
         return out
+
+    # ── upload / reference images (RPC `maseQ`) ──────────────────
+    # Mapped from live traffic (see API.md "Upload / reference images"): the
+    # image bytes ride INLINE as base64 inside an ordinary batchexecute POST.
+    # There is no multipart endpoint and flow-content.google is not involved.
+    def upload_image(self, data, mime="image/jpeg", filename="",
+                     project_id=None, token=""):
+        """Upload an image to the project's Uploads as a prompt ingredient.
+
+        `data` is raw bytes, or an already-base64 string. Returns a dict on
+        success, None on failure (with `last_error` set).
+
+        Decoded payload from the real request:
+          [ [null,22,null,null,null,"<pid>",null,null,null,null,["<tok>",1]],
+            "<base64>", "image/jpeg", 1, null, null, null, null,
+            "<filename>", null, "<uuid upper>", "<uuid upper>" ]
+        The token at [0][10][0] (2553 chars, origin unidentified) is optional
+        here — sent only when a caller supplies one — because it is not known
+        to be required.
+        """
+        import base64 as _b64
+        import re as _re
+        import uuid as _uuid
+        self.last_error = ""
+        if not data:
+            self.last_error = "upload: no image data"
+            return None
+        blob = b""
+        if isinstance(data, (bytes, bytearray)):
+            blob = bytes(data)
+            b64 = _b64.b64encode(blob).decode("ascii")
+        else:
+            b64 = str(data).strip()
+            try:
+                blob = _b64.b64decode(b64, validate=False)
+            except Exception:
+                blob = b""
+        if not b64:
+            self.last_error = "upload: empty base64 payload"
+            return None
+        # sniff the mime when the caller did not say (JPEG/PNG/WebP magic)
+        if blob:
+            if blob[:3] == b"\xff\xd8\xff":
+                mime = "image/jpeg"
+            elif blob[:8] == b"\x89PNG\r\n\x1a\n":
+                mime = "image/png"
+            elif blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+                mime = "image/webp"
+        if not filename:
+            ext = {"image/png": "png", "image/webp": "webp"}.get(mime, "jpg")
+            filename = f"upload-{int(time.time())}.{ext}"
+        pid = project_id or load_state().get("project_id", "")
+        if not pid:
+            pid = self.create_project()
+        if not pid:
+            self.last_error = "upload: no project id (auto-create failed)"
+            return None
+        # the call must come from the project page: that is where the app
+        # issues it (source-path + origin context)
+        try:
+            if f"/project/{pid}" not in (self.page.url or ""):
+                self.goto_app(f"/project/{pid}")
+                self._pump(seconds=3)
+        except Exception:
+            pass
+        payload = build_upload_payload(
+            pid, b64, mime=mime, filename=filename, token=token,
+            uuid_a=str(_uuid.uuid4()).upper(),
+            uuid_b=str(_uuid.uuid4()).upper())
+        # An upload carries megabytes of base64 through URL-encoded POST, so
+        # the in-page fetch needs far more room than the 45s default.
+        d = self.call("maseQ", payload, pid, timeout_ms=180000,
+                      eval_timeout=220)
+        if d is None:
+            if not self.last_error:
+                self.last_error = "upload: maseQ returned no data"
+            return None
+        uuid_re = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                   r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+        found = {"uuids": [], "urls": []}
+
+        def walk(o):
+            if isinstance(o, list):
+                for v in o:
+                    walk(v)
+            elif isinstance(o, str):
+                if _re.fullmatch(uuid_re, o) and o not in found["uuids"]:
+                    found["uuids"].append(o)
+                for m in _re.finditer(
+                        r"https://flow-content\.google/[A-Za-z0-9_\-/]+"
+                        r"\?[^\"\s\\]*", o):
+                    u = (m.group(0).replace("\\u0026", "&")
+                         .replace("\\u003d", "="))
+                    if u not in found["urls"]:
+                        found["urls"].append(u)
+        walk(d)
+        media_uuid = found["uuids"][0] if found["uuids"] else ""
+        self.last_error = ""
+        _log(f"[*] upload ok ({len(blob) or len(b64)}B -> {mime}, "
+             f"{len(found['uuids'])} uuid(s)) media={media_uuid[:12] or 'n/a'}")
+        return {
+            "media_uuid": media_uuid,
+            "mime": mime,
+            "filename": filename,
+            "project": pid,
+            "bytes": len(blob),
+            "uuids": found["uuids"][:6],
+            "urls": found["urls"][:2],
+            "raw": d if isinstance(d, list) and len(str(d)) < 4000 else "",
+        }
 
     # ── generation (payload VERIFIED against the app's real request) ──
     # Captured from the live composer (recon/auth/ogiz0b_real.json):
@@ -1223,7 +1377,7 @@ class HeadlessEngine:
             self.page.keyboard.type(prompt, delay=15)
             time.sleep(1.5)
             self.page.keyboard.press("Enter")
-            deadline = time.time() + 90
+            deadline = time.time() + RESPONSE_TIMEOUT
             while time.time() < deadline and not caught:
                 try:
                     self.page.evaluate("1")

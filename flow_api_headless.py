@@ -26,8 +26,12 @@ import flow_store as _fs
 import flow_auth as _auth
 
 ASPECTS = {"16:9": 3, "4:3": 5, "1:1": 1, "3:4": 4, "9:16": 2}
-MODELS = ["NARWHAL", "HARBOR_SEAL", "GEM_PIX_2"]  # keep list stable; BELUGA valid via norm_model
+MODELS = ["BELUGA", "HARBOR_SEAL", "GEM_PIX_2"]  # BELUGA is the live default
 MODEL_DISPLAY = {
+    "NANO BANANA 2.1": "BELUGA",
+    "NANO BANANA 2.1 THINKING LOW": "BELUGA_THINKING_LOW",
+    "NANO BANANA 2.1 THINKING MED": "BELUGA_THINKING_MED",
+    "NANO BANANA 2.1 THINKING HIGH": "BELUGA_THINKING_HIGH",
     "NANO BANANA 2": "NARWHAL", "NANO BANANA 2 LITE": "HARBOR_SEAL",
     "NANO BANANA PRO": "GEM_PIX_2", "NARWHAL": "NARWHAL",
     "HARBOR_SEAL": "HARBOR_SEAL", "GEM_PIX_2": "GEM_PIX_2",
@@ -41,9 +45,19 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 
 def norm_model(name):
-    if not name:
-        return "NARWHAL"
-    return MODEL_DISPLAY.get(str(name).strip().upper(), str(name).strip().upper())
+    """Human/model name -> wire code. An empty name means the current default.
+
+    Delegates to flow_headless's tables, which are the complete verified maps.
+    Two bugs lived here: an omitted model returned NARWHAL (deprecated,
+    shuts down 2026-10-29) instead of DEFAULT_MODEL, and the local table did
+    not know BELUGA, so "NANO BANANA 2.1" fell through unmapped.
+    """
+    try:
+        from flow_headless import norm_model as _norm
+        return _norm(name)
+    except Exception:
+        k = str(name or "").strip().upper()
+        return MODEL_DISPLAY.get(k, k) if k else "BELUGA"
 
 
 def _load_dotenv():
@@ -1151,6 +1165,27 @@ class FlowAPI:
                     if out else {"ok": False, "error": "upscale failed"})
         return self.run(job, timeout=600)
 
+    def upload(self, data, mime="image/jpeg", filename="", project_id=None):
+        """Upload a reference image into the project (RPC `maseQ`).
+
+        Runs synchronously: an upload is quick next to a generation and the
+        caller wants the media id straight back. The bytes travel as inline
+        base64 inside an ordinary batchexecute POST — the app's real shape —
+        issued from inside the page like every other RPC here.
+        """
+        def job():
+            r = self.engine.upload_image(data, mime=mime, filename=filename,
+                                         project_id=project_id)
+            if not r:
+                return {"ok": False,
+                        "error": getattr(self.engine, "last_error", "")
+                                 or "upload failed"}
+            return {"ok": True, **r}
+        try:
+            return self.run(job, timeout=420)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
     # ── feature catalogue: everything the Flow side exposes ──────
     def models(self):
         """Full catalogue — models, aspects, upscale targets, endpoints.
@@ -1197,7 +1232,7 @@ class FlowAPI:
                         "/credits", "/projects", "/project", "/project/new",
                         "/history", "/jobs", "/jobs/<id>", "/logs", "/media/<uuid>",
                         "/media/<uuid>?info=1", "/restart", "/ui"],
-                "POST": ["/generate", "/upscale", "/cookies"],
+                "POST": ["/generate", "/upscale", "/upload", "/cookies"],
             },
             "generate_params": {
                 "prompt": "required, string",

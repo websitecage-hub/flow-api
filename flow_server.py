@@ -76,6 +76,12 @@ def _api_keys():
 API_KEYS = _api_keys()
 RATE_POST_PER_MIN = int(os.environ.get("RATE_POST_PER_MIN", "20"))
 RATE_GET_PER_MIN = int(os.environ.get("RATE_GET_PER_MIN", "120"))
+# /upload ceiling, in DECODED megabytes. The image is base64'd and then
+# urlencoded on the wire, so peak memory is several times the file size — and
+# this container is 512MB shared with the browser. 4MB of image = ~5.4MB b64
+# = ~9MB urlencoded, which is comfortable; anything larger risks the OOM
+# killer, which would take the whole service down for every caller.
+MAX_UPLOAD_MB = float(os.environ.get("FLOW_MAX_UPLOAD_MB", "4"))
 _BUCKETS = {}
 _BUCKETS_LOCK = threading.Lock()
 
@@ -158,6 +164,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         except Exception:
             pass
+
+    def _read_raw(self):
+        """The raw POST body, whatever it is. /upload needs this: a caller may
+        send the image bytes directly (curl --data-binary) instead of JSON."""
+        ln = int(self.headers.get("Content-Length") or 0)
+        if ln <= 0:
+            return b""
+        return self.rfile.read(ln)
 
     def _read_json(self):
         ln = int(self.headers.get("Content-Length") or 0)
@@ -347,7 +361,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(404, {"ok": False, "error": "not found",
                              "endpoints": ["/health", "/models", "/whoami",
                                            "/restart", "/session", "/diag",
-                                           "/generate", "/upscale", "/jobs",
+                                           "/generate", "/upscale", "/upload",
+                                           "/jobs",
                                            "/jobs/<id>", "/logs",
                                            "/history", "/media/<uuid>",
                                            "/media/<uuid>?info=1", "/credits",
@@ -357,10 +372,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Drain the request body FIRST — if we 401/429 before reading it, the
         # leftover bytes corrupt the next request on a keep-alive connection
         # (client sees "Bad request syntax '<json body>GET /... HTTP/1.1'").
+        # Read it RAW so /upload can also accept the image bytes directly.
+        raw_body = b""
         try:
-            j = self._read_json()
+            raw_body = self._read_raw()
         except Exception:
-            j = {}
+            raw_body = b""
+        j = {}
+        if raw_body:
+            try:
+                j = json.loads(raw_body.decode("utf-8"))
+            except Exception:
+                j = {}
         if not self._gate(is_post=True, need_auth=True):
             return
         p = urllib.parse.urlparse(self.path)
@@ -443,6 +466,78 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                          project_id=j.get("projectId") or None)
                 self._send(202, {"ok": True, "job": jid,
                                  "poll": f"/jobs/{jid}"})
+        elif p.path == "/upload":
+            # Upload a reference image so it appears in the project's Uploads
+            # as a prompt ingredient. Mapped from live traffic: RPC `maseQ`,
+            # with the bytes INLINE as base64 in an ordinary batchexecute POST
+            # (no multipart endpoint exists in the Flow app). Issued in-page
+            # through JS_RPC like every other call here.
+            #
+            # Two accepted forms:
+            #   1. JSON  {"image_base64": "...", "filename": "x.jpg",
+            #             "mime": "image/jpeg", "projectId": "<uuid>"}
+            #      ("image" and "data" are accepted as aliases)
+            #   2. the raw image bytes as the body with an image/* content-type
+            #      (curl --data-binary @x.jpg -H 'Content-Type: image/jpeg')
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            data = ""
+            filename = ""
+            mime = "image/jpeg"
+            if isinstance(j, dict) and (j.get("image_base64") or j.get("image")
+                                        or j.get("data")):
+                data = (j.get("image_base64") or j.get("image")
+                        or j.get("data") or "")
+                filename = (j.get("filename") or "").strip()
+                mime = ((j.get("mime") or j.get("content_type") or "").strip()
+                        or mime)
+            elif raw_body and not ctype.startswith("application/json"):
+                import base64 as _b64
+                data = _b64.b64encode(raw_body).decode("ascii")
+                mime = ctype.split(";")[0].strip() or mime
+                filename = (qs.get("filename", [""])[0] or "").strip()
+            if not data:
+                self._send(400, {
+                    "ok": False,
+                    "error": "image required",
+                    "hint": ('send JSON {"image_base64": "<base64>"} or the raw '
+                             'image bytes with an image/* Content-Type'),
+                    "max_mb": MAX_UPLOAD_MB,
+                })
+                return
+            # base64 of the body must fit the memory budget: this is a 512MB
+            # container shared with the browser, and the payload is copied a
+            # few times on the way through (json -> b64 -> urlencoded form).
+            approx_mb = (len(str(data)) * 3 // 4) / 1048576.0
+            if approx_mb > MAX_UPLOAD_MB:
+                self._send(413, {
+                    "ok": False,
+                    "error": f"image too large ({approx_mb:.1f} MB decoded)",
+                    "max_mb": MAX_UPLOAD_MB,
+                })
+                return
+            fn = getattr(api, "upload", None)
+            if fn is None:
+                self._send(501, {"ok": False,
+                                 "error": "upload unavailable in this role"})
+                return
+            # Same one-job-at-a-time reasoning as /generate: the upload shares
+            # the single worker (and the single page), so queueing behind a
+            # 10-minute generation would just time the caller out.
+            try:
+                if api.is_busy():
+                    self._send(429, {"ok": False,
+                                     "error": "a job is already running",
+                                     "retry_after_s": 30},
+                               headers={"Retry-After": "30"})
+                    return
+            except Exception:
+                pass
+            print(f"[server] upload: {len(str(data))} b64 chars, "
+                  f"mime={mime}, name={filename or '(auto)'}", flush=True)
+            res = fn(data, mime=mime, filename=filename,
+                     project_id=((j.get("projectId") or j.get("project_id")
+                                  or None) if isinstance(j, dict) else None))
+            self._send(200 if res.get("ok") else 500, res)
         elif p.path == "/worker/heartbeat":
             import flow_store as _fs
             w = (j.get("worker") or "worker").strip()[:40]
