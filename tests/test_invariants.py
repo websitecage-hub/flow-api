@@ -456,6 +456,44 @@ check("upload enforces a size ceiling", "MAX_UPLOAD_MB" in _srv2
 check("upload is listed in the catalogue",
       "/upload" in (cat.get("endpoints", {}).get("POST") or []))
 
+# ── 14. "composer not found" must be diagnosable and cheap to recover ───────
+# It used to: log nothing about the page, and immediately report "not logged in"
+# — which routed to a re-mint + full browser rebuild (~3-4 min) for what is
+# usually just a bad page load.
+print("\n[14] composer-missing path")
+
+check("engine exposes page_probe()",
+      hasattr(FH.HeadlessEngine, "page_probe"))
+_probe_src = inspect.getsource(FH.HeadlessEngine.page_probe)
+for field in ("url", "title", "ready", "has_at", "editables", "buttons",
+              "html_len", "text"):
+    check(f"page_probe reports {field}", field in _probe_src)
+check("page_probe is defensive (returns an error dict, never raises)",
+      "except Exception" in _probe_src and '"error"' in _probe_src)
+
+check("engine exposes _wait_composer()",
+      hasattr(FH.HeadlessEngine, "_wait_composer"))
+check("composer check requires visible AND enabled",
+      "aria-disabled" in FH.HeadlessEngine.COMPOSER_JS
+      and "width" in FH.HeadlessEngine.COMPOSER_JS)
+
+_gen_src = inspect.getsource(FH.HeadlessEngine.generate)
+check("generate probes the page when the composer is missing",
+      "page_probe" in _gen_src)
+check("generate reloads once before giving up",
+      "reloading the app once" in _gen_src and "_wait_composer()" in _gen_src)
+check("generate distinguishes /about (logged out) from no-hydration",
+      '"/about"' in _gen_src and "never hydrated" in _gen_src)
+check("the failure message carries the page URL for diagnosis",
+      "page={url" in _gen_src or "page=" in _gen_src)
+
+_diag_src = inspect.getsource(F.FlowAPI.diag)
+check("/diag runs as an internal op (so it can report at all)",
+      "_internal=True" in _diag_src)
+check("/diag no longer uses the plain 150s dispatch",
+      "timeout=150)" not in _diag_src)
+check("/diag reports the page state", "page_probe" in _diag_src)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

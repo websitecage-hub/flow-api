@@ -939,6 +939,22 @@ class FlowAPI:
                 out["steps"]["load"] = {"ok": False, "error": str(e)[:200]}
                 out["verdict"] = "browser cannot load flow.google.com (network?)"
                 return out
+            # What the page actually is. Without this, "the app never
+            # hydrated", "redirected to /about", and "no network" are all
+            # reported as the same generic failure.
+            try:
+                pg = eng.page_probe()
+                out["steps"]["page"] = {
+                    "ok": bool(pg.get("has_at")) and not pg.get("error"),
+                    "url": pg.get("url"), "title": pg.get("title"),
+                    "ready": pg.get("ready"), "has_at": pg.get("has_at"),
+                    "editables": pg.get("editables"),
+                    "buttons": pg.get("buttons"),
+                    "text": pg.get("text"),
+                    "error": pg.get("error"),
+                }
+            except Exception as e:
+                out["steps"]["page"] = {"ok": False, "error": str(e)[:150]}
             try:
                 fp = eng.page.evaluate("""() => ({
                     webdriver: navigator.webdriver,
@@ -996,7 +1012,12 @@ class FlowAPI:
                                   "own reCAPTCHA token via the composer)")
             return out
         try:
-            return self.run(job, timeout=150)
+            # _internal=True: the self-test occupies the worker, but it is
+            # SERVICE-owned work, not a user job. Without this the job counted
+            # itself as busy, so the in-job `is_busy()` guard ALWAYS fired and
+            # /diag answered "engine is busy — re-run once it finishes" even on
+            # a completely idle service. The diagnostic endpoint was unusable.
+            return self.run(job, timeout=180, _internal=True)
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 

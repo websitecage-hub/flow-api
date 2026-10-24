@@ -847,6 +847,58 @@ class HeadlessEngine:
                 pass
             time.sleep(0.5)
 
+    # A composer that is visible AND enabled — not merely present in the DOM.
+    COMPOSER_JS = """() => {
+      const el = document.querySelector('[contenteditable="true"]');
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return false;
+      return !el.hasAttribute('disabled') &&
+             el.getAttribute('aria-disabled') !== 'true';
+    }"""
+
+    def page_probe(self) -> dict:
+        """What the page ACTUALLY is right now.
+
+        "composer not found" is dangerously ambiguous: a dead login, a redirect
+        to /about, a 404 project page, a consent/error surface, and an app that
+        simply has not hydrated yet on a 0.1-CPU box all look identical from the
+        outside. Logging the URL plus a text snippet is what tells them apart —
+        without it every one of those is misreported as "not logged in", which
+        triggers a re-mint and a full browser rebuild for what is usually just a
+        bad page load.
+        """
+        try:
+            return self.page.evaluate("""() => {
+              const b = document.body ? (document.body.textContent || '') : '';
+              return {
+                url: location.href,
+                title: document.title,
+                ready: document.readyState,
+                has_at: !!(window.WIZ_global_data &&
+                           window.WIZ_global_data.SNlM0e),
+                editables: document.querySelectorAll(
+                    '[contenteditable="true"]').length,
+                buttons: document.querySelectorAll('button,[role=button]').length,
+                html_len: document.documentElement.innerHTML.length,
+                text: b.replace(/\\s+/g, ' ').trim().slice(0, 180)
+              };
+            }""")
+        except Exception as e:
+            return {"error": str(e)[:140]}
+
+    def _wait_composer(self, timeout: float = 0) -> bool:
+        """Wait for a visible, enabled composer. True if it appeared."""
+        deadline = time.time() + (timeout or COMPOSER_TIMEOUT)
+        while time.time() < deadline:
+            try:
+                if self.page.wait_for_function(self.COMPOSER_JS, timeout=8000):
+                    return True
+            except Exception:
+                pass
+            self._pump(seconds=0.5)
+        return False
+
     def close(self):
         for fn in (lambda: self.ctx and self.ctx.close(),
                    lambda: self.pw and self.pw.stop()):
@@ -1337,25 +1389,7 @@ class HeadlessEngine:
         # slow on Render free's 0.1 CPU (and on a cold project page), so a 6 s
         # sleep often finds an empty DOM and wrongly reports "not logged in".
         # First load after a fresh login is the slow case (up to ~2 min).
-        _deadline = time.time() + COMPOSER_TIMEOUT
-        while time.time() < _deadline:
-            try:
-                # visible + enabled, not merely present in the DOM
-                _ready = self.page.wait_for_function(
-                    """() => {
-                      const el = document.querySelector('[contenteditable="true"]');
-                      if (!el) return false;
-                      const r = el.getBoundingClientRect();
-                      if (r.width <= 0 || r.height <= 0) return false;
-                      return !el.hasAttribute('disabled') &&
-                             el.getAttribute('aria-disabled') !== 'true';
-                    }""",
-                    timeout=8000)
-                if _ready:
-                    break
-            except Exception:
-                pass
-            self._pump(seconds=0.5)
+        self._wait_composer()
         self._pump(seconds=2)
         caught = []
 
@@ -1369,10 +1403,37 @@ class HeadlessEngine:
         try:
             box = self.page.locator("[contenteditable=true]").first
             if box.count() == 0:
-                self.last_error = ("composer not found — not logged in? "
-                                   "(seed FLOW_COOKIES_JSON / PROFILE_TAR_URL)")
-                _log(f"[!] generate: {self.last_error}")
-                return None
+                # A missing composer is usually a BAD PAGE LOAD, not a dead
+                # login: the page may be a redirect, a 404 project, an error or
+                # consent surface, or simply not hydrated yet. Probe it (so the
+                # logs say which), then reload once and wait again. A reload
+                # costs ~1 min; the session-heal path it used to trigger costs
+                # ~3-4 min, a fresh reCAPTCHA score, and a rebuilt browser.
+                probe = self.page_probe()
+                _log(f"[!] generate: composer not found — page={json.dumps(probe)}")
+                _log("[*] generate: reloading the app once and waiting again")
+                try:
+                    self.goto_app(f"/project/{pid}")
+                except Exception as e:
+                    _log(f"[!] generate: reload failed: {str(e)[:120]}")
+                if self._wait_composer():
+                    _log("[*] generate: composer appeared after the reload")
+                    box = self.page.locator("[contenteditable=true]").first
+                else:
+                    probe = self.page_probe()
+                    url = str(probe.get("url") or "?")
+                    # a genuinely logged-out session lands on /about; anything
+                    # else is the app failing to hydrate, and saying "not logged
+                    # in" for that sends the wrong recovery down the wrong path
+                    why = ("session looks logged out" if "/about" in url
+                           else "the app never hydrated")
+                    self.last_error = (
+                        f"composer not found after reload ({why}) — "
+                        f"page={url[:90]} ready={probe.get('ready')} "
+                        f"has_at={probe.get('has_at')} "
+                        f"text={str(probe.get('text'))[:60]!r}")
+                    _log(f"[!] generate: {self.last_error}")
+                    return None
             box.click()
             time.sleep(1)
             # clear any leftover text
