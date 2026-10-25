@@ -651,6 +651,8 @@ check("recent results refresh on a timer", "setInterval(loadRecent" in _ui)
 check("the old fire-and-forget poll is gone", "MAX_WAIT_S" not in _ui)
 check("429 is retried more than once on submit",
       "attempt ${i + 1}/8" in _ui)
+check("a stalled request is retried, not called a failed prompt",
+      "no response from the server" in _ui and "r.status === 0" in _ui)
 check("the key change invalidates cached image URLs", "SEEN.clear()" in _ui)
 
 # the history panel is only possible because the server can list media

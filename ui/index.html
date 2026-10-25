@@ -343,6 +343,16 @@ async function submit(body) {
       return {ok: false, msg: 'not authorised — put your API key in the box at ' +
                               'the top right and press Save key'};
     }
+    if (r.status === 0) {
+      // No response at all — the service is usually mid-restart (every deploy,
+      // and Render restarts on its own). A dead request is not a failed prompt,
+      // and reporting "submit failed" for one is how a working service looks
+      // broken. Retry it like any other transient.
+      $('#genNote').textContent =
+        `no response from the server — retrying in 10s (attempt ${i + 1}/8)`;
+      await new Promise(x => setTimeout(x, 10000));
+      continue;
+    }
     if (r.status === 429) {
       const w = Math.min(60, parseInt(r.retry || '30', 10) || 30);
       $('#genNote').textContent =
