@@ -11,6 +11,7 @@ run anywhere and catch the exact classes of bug that cost real debugging time:
 Run:  python tests/test_invariants.py     (or: pytest tests/)
 """
 import os
+import pathlib
 import sys
 import time
 
@@ -622,6 +623,41 @@ _eng2._at = ""
 _eng2._pump = lambda seconds=5: None
 check("wait_at gives up with '' when the token never appears",
       _eng2._wait_at(timeout=3) == "")
+
+# ── 17. the console UI must not look hung, and must not lose a result ───────
+# The reported symptom was "the jobs just run and run and no image shows up".
+# The server was fine (59 s end-to-end, /media in 0.4 s); all four defects were
+# in the page. These pin them shut.
+print("\n[17] console UI: nothing silently disappears")
+_ui = (pathlib.Path(ROOT) / "ui" / "index.html").read_text(encoding="utf-8")
+_srv = (pathlib.Path(ROOT) / "flow_server.py").read_text(encoding="utf-8")
+
+check("no lazy images (a result must never wait for a scroll to load)",
+      'loading="lazy"' not in _ui)
+check("result images are eager", 'loading="eager"' in _ui)
+check("a live placeholder exists so a render never looks frozen",
+      "skeleton" in _ui and "spinner" in _ui)
+check("the placeholder ticks elapsed seconds",
+      "ptime" in _ui and "elapsed" in _ui)
+check("the placeholder names the engine stage",
+      "engine: generating" in _ui)
+check("the wait tells the user the normal duration", "60–120 s" in _ui)
+check("a reload RESUMES the running job instead of orphaning it",
+      "flowjob" in _ui and "resume" in _ui)
+check("a finished-while-away job is recovered on load",
+      "recovered" in _ui)
+check("recent results are re-fetched from the server", "/media?limit=" in _ui)
+check("recent results refresh on a timer", "setInterval(loadRecent" in _ui)
+check("the old fire-and-forget poll is gone", "MAX_WAIT_S" not in _ui)
+check("429 is retried more than once on submit",
+      "attempt ${i + 1}/8" in _ui)
+check("the key change invalidates cached image URLs", "SEEN.clear()" in _ui)
+
+# the history panel is only possible because the server can list media
+check("GET /media lists recent media",
+      'p.path == "/media"' in _srv and "media_list(" in _srv)
+check("the media list is matched BEFORE the /media/<uuid> prefix branch",
+      _srv.find('p.path == "/media"') < _srv.find('p.path.startswith("/media/")'))
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

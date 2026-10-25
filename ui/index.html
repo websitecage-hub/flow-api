@@ -57,6 +57,18 @@
   .shot .meta{padding:8px 10px;font-size:11.5px;color:var(--dim);
     display:flex;justify-content:space-between;gap:8px;align-items:center}
   .shot a{color:var(--acc);text-decoration:none}
+  .gal:empty{display:none}
+  /* The placeholder that stands where the image will be. The old page showed
+     NOTHING while a render ran, so a 90-second wait looked identical to a
+     broken one — which is what read as "jobs just run and run". */
+  .skeleton{min-height:200px;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:10px;color:var(--dim);font-size:12.5px;
+    text-align:center;padding:14px;
+    background:repeating-linear-gradient(100deg,#0b0e13 0 18px,#121820 18px 36px)}
+  .spinner{width:26px;height:26px;border-radius:50%;
+    border:2.5px solid var(--line);border-top-color:var(--acc);
+    animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
   .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;
     border:1px solid var(--line);color:var(--dim)}
   .pill.ok{color:var(--ok);border-color:#1f6f31}
@@ -67,6 +79,8 @@
     margin-top:10px}
   .bar i{display:block;height:100%;width:0;background:var(--acc);
     transition:width .4s ease}
+  .bar i.done{background:var(--ok)}
+  .bar i.bad{background:var(--bad)}
   .tag{font-size:11px;color:var(--dim);border:1px solid var(--line);
     border-radius:6px;padding:3px 7px}
   code{background:#0b0e13;padding:1px 5px;border-radius:4px;font-size:12.5px}
@@ -114,9 +128,22 @@
     </div>
     <div class="bar"><i id="prog"></i></div>
     <p class="note" id="genNote" style="margin:8px 0 0">
-      Runs on the server. One generation at a time — a 429 just means wait.
-      Watermarks are removed automatically before the image is served.</p>
+      Runs on the server and typically takes <b>60–120 s</b> — that is the engine
+      rendering, not a hang. One generation at a time; a 429 just means wait.
+      Watermarks are removed before the image is served. You can reload or close
+      this page — the job keeps running and the result shows up under Recent.</p>
     <div class="gal" id="gal"></div>
+  </section>
+
+  <section>
+    <h2>Recent <span class="note" id="recentNote"
+      style="text-transform:none;letter-spacing:0"></span></h2>
+    <div class="row">
+      <span class="note" style="flex:1 1 auto">Newest first — everything that has
+        finished, including jobs started in another tab or before a reload.</span>
+      <button class="ghost" id="recentReload">Reload</button>
+    </div>
+    <div class="gal" id="recent"></div>
   </section>
 
   <section>
@@ -188,9 +215,12 @@ const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 /* ── status ─────────────────────────────────────────────────────── */
+let HEALTH = {};      // the live placeholder reads this to say what the engine
+                      // is genuinely doing while you wait
 async function pollHealth() {
   const r = await api('/health');
   const h = r.body || {};
+  HEALTH = h;
   const alive = h.engine_alive === true;
   $('#dot').className = 'dot ' + (r.ok ? (h.busy ? 'busy' : 'ok') : 'bad');
   $('#statusPill').className = 'pill ' + (r.ok ? (h.busy ? 'busy' : 'ok') : 'bad');
@@ -211,86 +241,211 @@ async function pollHealth() {
 }
 setInterval(pollHealth, 5000); pollHealth();
 
+/* ── media rendering ────────────────────────────────────────────── */
+/* Eager, NOT lazy: a result image that has to be scrolled into view before the
+   browser fetches it is indistinguishable from a missing image. */
+const SEEN = new Set();
+function shotEl(m) {
+  const u = m.uuid;
+  const d = document.createElement('div');
+  d.className = 'shot';
+  const dims = (m.width && m.height) ? ` · ${m.width}×${m.height}` : '';
+  d.innerHTML =
+    `<a href="${mediaURL(u)}" target="_blank">
+       <img src="${mediaURL(u)}" alt="${esc(m.prompt || u)}"
+            loading="eager" decoding="async">
+     </a>
+     <div class="meta">
+       <span>${esc(m.model || '')}${m.seed ? ' · seed ' + m.seed : ''}${dims}</span>
+       <a href="${mediaURL(u)}" download="flow-${esc(u)}.jpg">download</a>
+     </div>`;
+  return d;
+}
+/* the list arrives newest-first; prepending in reverse leaves newest on top */
+function renderTop(container, list) {
+  const fresh = (list || []).filter(m => m && m.uuid && !SEEN.has(m.uuid));
+  fresh.slice().reverse().forEach(m => {
+    SEEN.add(m.uuid);
+    container.prepend(shotEl(m));
+  });
+  return fresh.length;
+}
+
+/* ── recent: the durable answer to "where did my image go?" ─────── */
+async function loadRecent() {
+  const r = await api('/media?limit=48');
+  if (!r.ok) { $('#recentNote').textContent = '· unavailable (' + r.status + ')'; return; }
+  const list = (r.body || {}).media || [];
+  renderTop($('#recent'), list);
+  const n = $('#recent').children.length;
+  $('#recentNote').textContent = n
+    ? `· ${n} image${n === 1 ? '' : 's'} kept on the server`
+    : '· nothing yet';
+}
+
+/* ── the live placeholder that replaces "nothing happens" ───────── */
+let TICK = null;
+function makePending() {
+  const d = document.createElement('div');
+  d.className = 'shot';
+  d.innerHTML =
+    `<div class="skeleton">
+       <div class="spinner"></div>
+       <div><b id="ptime">0s</b> elapsed</div>
+       <div class="note" id="pstage">submitted…</div>
+     </div>`;
+  return d;
+}
+function startTick(el, t0) {
+  clearInterval(TICK);
+  const paint = () => {
+    const s = secs(Date.now() - t0);
+    const t = el.querySelector('#ptime'); if (t) t.textContent = s + 's';
+    const stage = HEALTH.busy ? 'engine: generating'
+                : HEALTH.engine_alive ? 'engine: waiting for the render slot'
+                : 'engine: starting up';
+    const sEl = el.querySelector('#pstage'); if (sEl) sEl.textContent = stage;
+    // the bar tracks progress toward a TYPICAL 90 s render and never claims
+    // completion while the job is still running (the old one just counted
+    // seconds up to 94% and sat there saying nothing)
+    $('#prog').style.width = Math.min(95, (s / 90) * 100) + '%';
+    $('#genNote').textContent =
+      `${s}s elapsed · ${stage} · a render normally takes 60–120 s`;
+  };
+  paint();
+  TICK = setInterval(paint, 1000);
+}
+function stopTick() { clearInterval(TICK); TICK = null; }
+
 /* ── generate ───────────────────────────────────────────────────── */
+let BUSY = false;
+
+async function submit(body) {
+  // 429 = the engine is mid-render. The old code retried once and then reported
+  // "submit failed" for a condition that always resolves by simply waiting.
+  for (let i = 0; i < 8; i++) {
+    const r = await api('/generate', {method: 'POST', body: JSON.stringify(body)});
+    if (r.status === 202 && r.body.job) return {ok: true, job: r.body.job};
+    if (r.status === 429) {
+      const w = Math.min(60, parseInt(r.retry || '30', 10) || 30);
+      $('#genNote').textContent =
+        `engine busy with another render — retrying in ${w}s (attempt ${i + 1}/8)`;
+      await new Promise(x => setTimeout(x, w * 1000));
+      continue;
+    }
+    return {ok: false, msg: JSON.stringify(r.body).slice(0, 240)};
+  }
+  return {ok: false, msg: 'engine stayed busy through every retry — try again shortly'};
+}
+
+async function watch(job, t0) {
+  const el = makePending();
+  $('#gal').prepend(el);
+  $('#prog').className = '';
+  $('#prog').style.width = '3%';
+  startTick(el, t0);
+  // Remember the job so a reload cannot orphan it: the result lives on the
+  // server, and the page must be able to find it again.
+  localStorage.setItem('flowjob', JSON.stringify({job, t0: Date.now()}));
+
+  let delay = 1500, jb = null;
+  for (;;) {
+    await new Promise(r => setTimeout(r, delay));
+    delay = Math.min(5000, delay + 700);        // eager early, patient later
+    const r = await api('/jobs/' + job);
+    jb = (r.body || {}).job || r.body || {};
+    if (jb.status === 'done' || jb.status === 'failed' || jb.status === 'error') break;
+    if (secs(Date.now() - t0) > 1200) {         // 20 min: stop, keep the result
+      stopTick();
+      el.remove();
+      localStorage.removeItem('flowjob');
+      $('#prog').style.width = '0';
+      $('#genNote').textContent =
+        'still running after 20 minutes — the engine may be rebuilding. The ' +
+        'image will appear under Recent as soon as it finishes.';
+      return;
+    }
+  }
+  stopTick();
+  el.remove();
+  localStorage.removeItem('flowjob');
+
+  const media = ((jb.result || {}).media) || jb.media || [];
+  const took = secs(Date.now() - t0);
+  if (jb.status === 'done') {
+    renderTop($('#gal'), media);
+    $('#prog').className = 'done';
+    $('#prog').style.width = '100%';
+    $('#genNote').textContent =
+      `done in ${took}s — ${media.length} image(s), watermark removed`;
+    loadRecent();
+  } else {
+    $('#prog').className = 'bad';
+    $('#prog').style.width = '100%';
+    $('#genNote').textContent = 'failed after ' + took + 's: ' +
+      JSON.stringify(jb.error || jb).slice(0, 200);
+  }
+  setTimeout(() => {$('#prog').className = ''; $('#prog').style.width = '0';}, 5000);
+}
+
 $('#go').onclick = async () => {
+  if (BUSY) return;
   const prompt = $('#prompt').value.trim();
   if (!prompt) return;
+  BUSY = true;
   const btn = $('#go'); btn.disabled = true;
-  $('#prog').style.width = '4%';
-  $('#genNote').textContent = 'submitting…';
+  $('#prog').className = ''; $('#prog').style.width = '3%';
   const body = {prompt, count: parseInt($('#count').value || '1', 10)};
   if ($('#model').value) body.model = $('#model').value;
   if ($('#aspect').value) body.aspect = $('#aspect').value;
-
-  let sub = await api('/generate', {method: 'POST', body: JSON.stringify(body)});
-  if (sub.status === 429) {
-    const wait = parseInt(sub.retry || '30', 10);
-    $('#genNote').textContent = `busy — retrying in ${wait}s`;
-    await new Promise(r => setTimeout(r, wait * 1000));
-    sub = await api('/generate', {method: 'POST', body: JSON.stringify(body)});
+  $('#genNote').textContent = 'submitting…';
+  const s = await submit(body);
+  if (!s.ok) {
+    $('#genNote').textContent = 'submit failed: ' + s.msg;
+    $('#prog').style.width = '0';
+    btn.disabled = false; BUSY = false;
+    return;
   }
-  if (!(sub.status === 202 && sub.body.job)) {
-    $('#genNote').textContent = 'submit failed: ' +
-      JSON.stringify(sub.body).slice(0, 220);
-    btn.disabled = false; $('#prog').style.width = '0'; return;
-  }
-  const job = sub.body.job;
-  $('#genNote').textContent = `job ${job} running…`;
-  const MAX_WAIT_S = 900;
-  let t0 = Date.now(), done = false;
-  while (!done) {
-    await new Promise(r => setTimeout(r, 4000));
-    // Cap the wait. Without this the loop spins forever if a job never
-    // resolves (engine rebuilding under it, or the worker wedged) and the
-    // page just looks hung with no way out but a reload.
-    if ((Date.now() - t0) / 1000 > MAX_WAIT_S) {
-      $('#prog').style.width = '100%';
-      $('#genNote').textContent =
-        `still running after ${Math.round(MAX_WAIT_S / 60)} min — the engine ` +
-        `may be rebuilding. Check /health, then hit Generate again.`;
-      break;
-    }
-    const j = await api('/jobs/' + job);
-    const jb = j.body.job || j.body || {};
-    const st = jb.status;
-    const secs = Math.round((Date.now() - t0) / 1000);
-    $('#prog').style.width = Math.min(94, 6 + secs) + '%';
-    $('#genNote').textContent = `job ${job} — ${st} (${secs}s)`;
-    if (st === 'done' || st === 'failed' || st === 'error') {
-      done = true;
-      const media = ((jb.result || {}).media) || jb.media || [];
-      $('#prog').style.width = '100%';
-      if (st === 'done') {
-        $('#genNote').textContent =
-          `done in ${secs}s — ${media.length} image(s), watermark removed`;
-        renderGallery(media);
-      } else {
-        $('#genNote').textContent = 'failed: ' +
-          JSON.stringify(jb.error || jb).slice(0, 200);
-      }
-    }
-  }
-  btn.disabled = false;
-  setTimeout(() => {$('#prog').style.width = '0';}, 1200);
+  $('#genNote').textContent = `job ${s.job} submitted — starting the render…`;
+  await watch(s.job, Date.now());
+  btn.disabled = false; BUSY = false;
 };
 
-function renderGallery(media) {
-  const g = $('#gal');
-  media.forEach(m => {
-    const u = m.uuid; if (!u) return;
-    const d = document.createElement('div');
-    d.className = 'shot';
-    d.innerHTML =
-      `<a href="${mediaURL(u)}" target="_blank">
-         <img src="${mediaURL(u)}" alt="${esc(m.prompt || u)}" loading="lazy">
-       </a>
-       <div class="meta">
-         <span>${esc(m.model || '')}${m.seed ? ' · seed ' + m.seed : ''}</span>
-         <a href="${mediaURL(u)}" download="flow-${u}.jpg">download</a>
-       </div>`;
-    g.prepend(d);
-  });
-}
+/* ── resume after a reload ──────────────────────────────────────── */
+/* Previously a reload (the natural reaction when a render looks slow) silently
+   orphaned the job: it finished on the server and the browser never showed it.
+   That is the most likely reason an image "never appeared". */
+(async function resume() {
+  await loadRecent();
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem('flowjob') || 'null'); } catch (e) {}
+  if (!saved || !saved.job) return;
+  const r = await api('/jobs/' + saved.job);
+  const jb = (r.body || {}).job || {};
+  const media = ((jb.result || {}).media) || jb.media || [];
+  if (jb.status === 'done' && media.length) {
+    localStorage.removeItem('flowjob');
+    renderTop($('#gal'), media);
+    $('#genNote').textContent =
+      `recovered — job ${saved.job} finished while the page was closed ` +
+      `(${media.length} image(s))`;
+    return;
+  }
+  if (jb.status === 'failed' || jb.status === 'error') {
+    localStorage.removeItem('flowjob');
+    $('#genNote').textContent = `job ${saved.job} ${jb.status}: ` +
+      JSON.stringify(jb.error || '').slice(0, 160);
+    return;
+  }
+  if (jb.status === 'running') {
+    BUSY = true; $('#go').disabled = true;
+    $('#genNote').textContent = `resuming job ${saved.job}…`;
+    await watch(saved.job, saved.t0 || Date.now());
+    BUSY = false; $('#go').disabled = false;
+    return;
+  }
+  localStorage.removeItem('flowjob');           // unknown job id
+})();
 
 /* ── upload a reference image ───────────────────────────────────── */
 const MAX_MB = 4;
@@ -313,7 +468,7 @@ $('#upGo').onclick = async () => {
   const send = () => api('/upload', {method: 'POST', body: JSON.stringify({
     image_base64: b64, filename: f.name, mime: f.type || 'image/jpeg'})});
   let r = await send();
-  if (r.status === 429) {
+  for (let i = 0; i < 4 && r.status === 429; i++) {
     const wait = parseInt(r.retry || '30', 10);
     $('#upNote').textContent = `busy — retrying in ${wait}s`;
     await new Promise(x => setTimeout(x, wait * 1000));
@@ -372,10 +527,16 @@ $('#saveKey').onclick = () => {
   KEY = $('#key').value.trim();
   localStorage.setItem('flowkey', KEY);
   $('#out').textContent = KEY ? 'key saved in this browser.' : 'key cleared.';
-  pollHealth();
+  // the key rides in the image URL, so cached <img> hits must be re-made
+  SEEN.clear();
+  $('#gal').innerHTML = '';
+  $('#recent').innerHTML = '';
+  pollHealth(); loadRecent();
 };
-$('#reload').onclick = () => { pollHealth(); $('#loadModels').click(); };
+$('#recentReload').onclick = loadRecent;
+$('#reload').onclick = () => { pollHealth(); loadRecent(); $('#loadModels').click(); };
 $('#loadModels').click();
+setInterval(loadRecent, 25000);   // pick up jobs finished in another tab
 </script>
 </body>
 </html>

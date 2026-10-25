@@ -325,6 +325,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "project": res})
             else:
                 self._send(500, {"ok": False, "error": "project create failed"})
+        elif p.path == "/media":
+            # Recent media, newest first. Without this the ONLY way an image was
+            # ever reachable was the tab that submitted it — reload the page (the
+            # natural thing to do when a job looks slow) and a finished result
+            # became invisible forever.
+            import flow_store as _fs
+            self._send(200, {"ok": True, "media": _fs.media_list(
+                int(qs.get("limit", ["48"])[0]))})
         elif p.path.startswith("/media/"):
             mid = urllib.parse.unquote(p.path[len("/media/"):])
             if qs.get("info", [""])[0] in ("1", "true", "yes"):
