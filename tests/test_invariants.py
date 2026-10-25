@@ -658,6 +658,22 @@ check("GET /media lists recent media",
       'p.path == "/media"' in _srv and "media_list(" in _srv)
 check("the media list is matched BEFORE the /media/<uuid> prefix branch",
       _srv.find('p.path == "/media"') < _srv.find('p.path.startswith("/media/")'))
+check("the page names a session recovery in the wait",
+      "recovering the Google session" in _ui)
+
+# ── 18. a logged-out page must not be reloaded into ─────────────────────────
+# Measured live: /about seen at 10:46:58, the reload burned until 10:49:15, and
+# the heal finished at 10:50:28 — 6m27s for one image, 2m17s of it spent
+# reloading a page a reload cannot fix, having already read the answer off the
+# URL. Fail immediately so the caller heals at once.
+print("\n[18] a logged-out page fails fast instead of burning a reload")
+_fh = (pathlib.Path(ROOT) / "flow_headless.py").read_text(encoding="utf-8")
+check("the composer miss reads the FIRST probe's url", "first_url" in _fh)
+check("'/about' short-circuits before the reload",
+      _fh.find('if "/about" in first_url:') <
+      _fh.find("generate: reloading the app once"))
+check("the fast path explains itself in the log",
+      "session looks logged out) —" in _fh)
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

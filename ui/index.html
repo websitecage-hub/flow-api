@@ -301,13 +301,26 @@ function startTick(el, t0) {
   const paint = () => {
     const s = secs(Date.now() - t0);
     const t = el.querySelector('#ptime'); if (t) t.textContent = s + 's';
-    const stage = HEALTH.busy ? 'engine: generating'
-                : HEALTH.engine_alive ? 'engine: waiting for the render slot'
-                : 'engine: starting up';
-    const sEl = el.querySelector('#pstage'); if (sEl) sEl.textContent = stage;
-    // the bar tracks progress toward a TYPICAL 90 s render and never claims
-    // completion while the job is still running (the old one just counted
-    // seconds up to 94% and sat there saying nothing)
+    const H = HEALTH || {};
+    // Name the ACTUAL reason it is slow. A dead session costs ~2-3 min of
+    // healing, and a page that silently says nothing for 6 minutes is exactly
+    // what "the jobs just run and run" meant.
+    const stage =
+        (H.session_ok === false || H.has_at === false)
+          ? 'recovering the Google session — this takes ~2–3 min'
+      : (H.engine_responsive === false)
+          ? 'rebuilding the browser after a session recovery'
+      : (H.busy && H.session_ok !== false) ? 'engine: generating'
+      : H.busy ? 'finishing the previous render'
+      : H.engine_alive ? 'engine: waiting for the render slot'
+      : 'engine: starting up';
+    const sEl = el.querySelector('#pstage');
+    if (sEl) {
+      sEl.textContent = stage;
+      sEl.style.color = /recover|rebuild/.test(stage) ? 'var(--warn)' : '';
+    }
+    // the bar tracks a TYPICAL 90 s render and never claims completion while the
+    // job is still running (the old one counted seconds to 94% and sat there)
     $('#prog').style.width = Math.min(95, (s / 90) * 100) + '%';
     $('#genNote').textContent =
       `${s}s elapsed · ${stage} · a render normally takes 60–120 s`;
@@ -326,6 +339,10 @@ async function submit(body) {
   for (let i = 0; i < 8; i++) {
     const r = await api('/generate', {method: 'POST', body: JSON.stringify(body)});
     if (r.status === 202 && r.body.job) return {ok: true, job: r.body.job};
+    if (r.status === 401) {
+      return {ok: false, msg: 'not authorised — put your API key in the box at ' +
+                              'the top right and press Save key'};
+    }
     if (r.status === 429) {
       const w = Math.min(60, parseInt(r.retry || '30', 10) || 30);
       $('#genNote').textContent =
@@ -345,8 +362,9 @@ async function watch(job, t0) {
   $('#prog').style.width = '3%';
   startTick(el, t0);
   // Remember the job so a reload cannot orphan it: the result lives on the
-  // server, and the page must be able to find it again.
-  localStorage.setItem('flowjob', JSON.stringify({job, t0: Date.now()}));
+  // server, and the page must be able to find it again. Store the ORIGINAL
+  // start time, so a second reload does not reset the elapsed counter to zero.
+  localStorage.setItem('flowjob', JSON.stringify({job, t0}));
 
   let delay = 1500, jb = null;
   for (;;) {

@@ -1464,6 +1464,19 @@ class HeadlessEngine:
                 # ~3-4 min, a fresh reCAPTCHA score, and a rebuilt browser.
                 probe = self.page_probe()
                 _log(f"[!] generate: composer not found — page={json.dumps(probe)}")
+                first_url = str(probe.get("url") or "")
+                if "/about" in first_url:
+                    # Flow's logged-out landing page. A reload CANNOT restore a
+                    # missing session, and waiting one out was pure loss —
+                    # measured live: /about seen at 10:46:58, reload burned
+                    # until 10:49:15, heal finished 10:50:28. Six and a half
+                    # minutes for one image, 2m17s of it knowing the answer.
+                    # Fail now so the caller heals immediately.
+                    self.last_error = (
+                        f"composer not found (session looks logged out) — "
+                        f"page={first_url[:90]} has_at={probe.get('has_at')}")
+                    _log(f"[!] generate: {self.last_error}")
+                    return None
                 _log("[*] generate: reloading the app once and waiting again")
                 try:
                     self.goto_app(f"/project/{pid}")
