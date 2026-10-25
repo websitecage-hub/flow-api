@@ -12,6 +12,7 @@ Run:  python tests/test_invariants.py     (or: pytest tests/)
 """
 import os
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -577,6 +578,50 @@ check("a failed reload is logged, not swallowed",
       "reload failed" in _call_src)
 check("the reload targets the project page when there is one",
       "/project/{pid}" in _call_src)
+
+# A reload returns at "commit" — long before the app writes SNlM0e. Scraping
+# once immediately finds nothing and the session still gets declared dead
+# (observed live: 401 at :54, "no at token" at :10 of the next minute,
+# rebuild). The engine must WAIT for the token.
+check("engine has _wait_at()", hasattr(FH.HeadlessEngine, "_wait_at"))
+check("an `at` wait exists (AT_WAIT_S)", hasattr(FH, "AT_WAIT_S")
+      and FH.AT_WAIT_S > 0, str(getattr(FH, "AT_WAIT_S", None)))
+check("call() WAITS for the token instead of scraping once",
+      "_wait_at(" in _call_src)
+check("the no-token failure names the wait",
+      "after waiting" in _call_src)
+
+
+class _AtPage:
+    """Page stub whose token appears on the third scrape."""
+
+    def __init__(self):
+        self.scrapes = 0
+
+    def evaluate(self, *a, **k):
+        self.scrapes += 1
+        return "TOK:123" if self.scrapes >= 3 else ""
+
+
+_eng = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng.page = _AtPage()
+_eng._at = ""
+_eng._pump = lambda seconds=5: None
+t0 = time.time()
+_got = _eng._wait_at(timeout=30)
+_dt = time.time() - t0
+check("wait_at returns once the token appears", _got == "TOK:123", _got)
+check("it polled rather than accepting the first empty scrape",
+      _eng.page.scrapes >= 3, str(_eng.page.scrapes))
+check("it returned promptly after the token existed (no full-timeout burn)",
+      _dt < 20, f"{_dt:.1f}s")
+
+_eng2 = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng2.page = type("P", (), {"evaluate": lambda s, *a, **k: ""})()
+_eng2._at = ""
+_eng2._pump = lambda seconds=5: None
+check("wait_at gives up with '' when the token never appears",
+      _eng2._wait_at(timeout=3) == "")
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

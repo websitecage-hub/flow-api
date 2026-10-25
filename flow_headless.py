@@ -84,6 +84,13 @@ COMPOSER_TIMEOUT = int(os.environ.get("FLOW_COMPOSER_TIMEOUT", "120"))
 # succeed AND restarts the browser underneath it. Waiting is cheaper.
 RESPONSE_TIMEOUT = int(os.environ.get("FLOW_RESPONSE_TIMEOUT", "240"))
 
+# How long to WAIT for the page's `at` (XSRF) token to exist before calling it
+# missing. The token only appears once the app initialises, and a navigation
+# completes at "commit" long before that — so scraping once, immediately, finds
+# nothing and a healthy session gets declared "logged out", costing a re-mint
+# and a full browser rebuild. Waiting is far cheaper than that recovery.
+AT_WAIT_S = int(os.environ.get("FLOW_AT_WAIT_S", "60"))
+
 
 def _proxy_config():
     """Optional egress proxy for the browser, from FLOW_PROXY_URL.
@@ -1094,6 +1101,23 @@ class HeadlessEngine:
             self._at = ""
         return self._at
 
+    def _wait_at(self, timeout: float = 0) -> str:
+        """Poll the page until its `at` (XSRF) token exists. '' on timeout.
+
+        `at` lives in WIZ_global_data, which the app writes as it initialises —
+        long after a navigation reports "commit". So an immediate scrape after a
+        reload legitimately finds nothing, and treating that as "session lost"
+        triggered a re-mint + browser rebuild for what was only a slow page
+        load. Waits, because waiting is cheap and that recovery is not.
+        """
+        deadline = time.time() + (timeout or AT_WAIT_S)
+        while time.time() < deadline:
+            t = self.at_token(refresh=True)
+            if t:
+                return t
+            self._pump(seconds=1.5)
+        return ""
+
     def call(self, rpcid: str, payload, project_id: str = "",
              timeout_ms: int = 0, eval_timeout: float = 60):
         """POST a batchexecute RPC from inside the page. Returns parsed data.
@@ -1111,20 +1135,20 @@ class HeadlessEngine:
         for attempt in (0, 1):
             at = (self._live_at or self.at_token(refresh=(attempt == 1)))
             if not at:
-                # No XSRF token means the page hasn't initialised (or the
-                # session lapsed). Firing anyway returns a confusing 401 and
-                # looks like an auth failure; say what it actually is.
-                if attempt == 0:
-                    self._live_at = ""
-                    self._at = ""
-                    try:
-                        self._pump(seconds=1.5)
-                    except Exception:
-                        pass
-                    continue
+                # No XSRF token yet. That is NOT proof of a dead login: the
+                # page may simply still be initialising (SNlM0e appears only
+                # once the app boots, which takes a while on 0.1 CPU), and a
+                # reload navigates with wait_until="commit" so it is barely
+                # started. WAIT for the token instead of concluding "logged
+                # out" — that wrong conclusion is what turned a token refresh
+                # into a re-mint + full browser rebuild.
+                self._live_at = ""
+                self._at = ""
+                at = self._wait_at(AT_WAIT_S if attempt == 0 else 20)
+            if not at:
                 self.last_error = "no at token"
-                _log(f"[!] rpc {rpcid}: no `at` token (page not initialised "
-                     f"or session lapsed) — not sending")
+                _log(f"[!] rpc {rpcid}: no `at` token after waiting — the page "
+                     f"never initialised (url={self.page_probe().get('url')!s:.80})")
                 return None
             r = self.page.evaluate(JS_RPC, {
                 "rpcid": rpcid, "payload": payload, "at": at, "pid": pid,
