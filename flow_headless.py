@@ -1134,14 +1134,22 @@ class HeadlessEngine:
                 break
             if (isinstance(r, dict) and r.get("status") in (401, 403)
                     and attempt == 0):
-                _log(f"[*] rpc {rpcid}: {r.get('status')} -> refreshing `at` "
-                     f"and retrying")
+                # A 401 from batchexecute means the XSRF `at` is stale — the
+                # SESSION is usually perfectly fine. Re-scraping the SAME page
+                # just hands back the same expired token, so the retry failed,
+                # the caller concluded "logged out", and the service re-minted
+                # + rebuilt itself — every ~11 minutes, killing whatever
+                # generation was in flight. A page RELOAD re-initialises
+                # WIZ_global_data with a fresh `at` and costs far less than a
+                # session heal.
+                _log(f"[*] rpc {rpcid}: {r.get('status')} -> reloading the page "
+                     f"for a fresh `at`, then retrying")
                 self._live_at = ""
                 self._at = ""
                 try:
-                    self._pump(seconds=1.5)
-                except Exception:
-                    pass
+                    self.goto_app(f"/project/{pid}" if pid else "/")
+                except Exception as e:
+                    _log(f"[!] rpc {rpcid}: reload failed: {str(e)[:110]}")
                 continue
             break
         if not isinstance(r, dict) or r.get("status") != 200:

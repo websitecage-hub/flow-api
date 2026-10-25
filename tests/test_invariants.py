@@ -560,6 +560,24 @@ check("the wrapper is unconditional (no `if arg is not None` gate)",
       "if arg is not None" not in _ev_src)
 check("None serialises to null in the call", "json.dumps(arg)" in _ev_src)
 
+# ── 16. a 401 means a stale `at`, not a dead session ────────────────────────
+# Re-scraping the same page returned the same expired token, so the retry
+# failed, the caller declared "logged out", and the service re-minted + rebuilt
+# every ~11 minutes — killing any generation in flight.
+print("\n[16] stale-`at` recovery")
+_call_src = inspect.getsource(FH.HeadlessEngine.call)
+check("call() retries after a 401/403", "401" in _call_src)
+check("the retry RELOADS the page for a fresh `at`",
+      "goto_app" in _call_src and "fresh `at`" in _call_src)
+check("it no longer just re-scrapes the same stale page",
+      "refreshing `at` and retrying" not in _call_src)
+check("both cached tokens are dropped before the retry",
+      '_live_at = ""' in _call_src and '_at = ""' in _call_src)
+check("a failed reload is logged, not swallowed",
+      "reload failed" in _call_src)
+check("the reload targets the project page when there is one",
+      "/project/{pid}" in _call_src)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)
