@@ -1400,6 +1400,15 @@ class HeadlessEngine:
         capture the response — same mechanism as a human, no result-fetching
         hacks.
 
+        KNOWN GAP (user-confirmed 2026-10-27): `aspect` is VALIDATED but never
+        APPLIED. This flow types the prompt and presses Enter without touching
+        the composer's aspect control, so Google applies its UI default (16:9)
+        no matter what the caller asked for. ASPECT_WIRE's enum numbers are
+        correct for the request shape; what is missing is driving the picker
+        (or finding where the composer exposes it) BEFORE Enter. A full HAR of
+        the user's actions is coming to map that properly — along with
+        image-to-image (maseQ attach), which needs the same capture.
+
         Self-heal: if the request is flagged (reCAPTCHA score changed) or the
         engine wedges, restart the browser once and retry — a fresh page gets a
         fresh reCAPTCHA iframe/token. This is what keeps generation from "going
