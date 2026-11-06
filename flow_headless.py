@@ -1260,6 +1260,18 @@ class HeadlessEngine:
             t = self.at_token(refresh=True)
             if t:
                 return t
+            # A logged-out page will NEVER grow a token, so do not spend the
+            # whole budget discovering that. Every doomed RPC was paying this:
+            # one dead session burned `project=181.7s` across the calls leading
+            # up to the heal. Failing fast here lets the caller's classifier
+            # request the heal, which is the only thing that can fix it.
+            try:
+                if "/about" in (self.page.url or ""):
+                    _log("[*] at: page is the logged-out surface — not waiting "
+                         "for a token that cannot appear")
+                    return ""
+            except Exception:
+                pass
             self._pump(seconds=1.5)
         return ""
 
@@ -1676,8 +1688,31 @@ class HeadlessEngine:
         # the real error. ensure_session's browser restart is only safe
         # between jobs (supervisor path), never inside one.
         if not self.session_ok():
-            _log("[*] generate: session check failed — continuing without "
-                 "restart (mid-job restart kills the page)")
+            # The account read failed. Two very different causes:
+            #   (a) the probe false-negatives on a slow nzlxg (it has before),
+            #       so bailing would cost a needless ~3-minute re-mint;
+            #   (b) the session is genuinely dead, and ploughing on is far
+            #       worse: every RPC that follows 401s, each one reloading the
+            #       page and waiting up to AT_WAIT_S for a token that can never
+            #       arrive. Measured live: `[timing] project=181.7s total=181.7s`
+            #       spent before admitting a session that was already dead at
+            #       second zero.
+            # So ask the PAGE, which is cheap and unambiguous: the logged-out
+            # surface is /about, and a live token (has_at) rules out (b)
+            # entirely. Fail fast only when it is really gone — and do not
+            # restart the browser here, which would kill the page the job
+            # holds; requesting a heal is the sanctioned path.
+            probe = self.page_probe()
+            url = str(probe.get("url") or "")
+            if "/about" in url and not probe.get("has_at"):
+                self.last_error = (
+                    "session check failed and the page is the logged-out "
+                    f"surface ({url[:60]}) — requesting heal")
+                _log(f"[!] generate: {self.last_error}; not attempting any RPC")
+                return None
+            _log("[*] generate: account probe failed but the page still looks "
+                 f"alive (url={url[:50]} has_at={probe.get('has_at')}) — "
+                 "continuing; the composer drive surfaces the real error")
             self.last_error = ""
         # ── TIMING ────────────────────────────────────────────────────────
         # "Make it faster" is guesswork without this. The render itself is

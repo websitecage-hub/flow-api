@@ -895,6 +895,47 @@ check("every referenced element id exists (no silent runtime null)",
       all(i in set(re.findall(r'id="([^"]+)"', _ui2))
           for i in set(re.findall(r"\$\$?\('#([a-zA-Z0-9_-]+)'\)", _ui2))))
 
+# ── 23. a dead session must not burn three minutes discovering itself ──────
+# Measured live: `[timing] generate project=181.7s total=181.7s` was spent
+# before admitting a session that was already dead at second zero — every RPC
+# 401ing, reloading the page, and waiting up to AT_WAIT_S for a token a
+# logged-out page can never produce.
+print("\n[23] a dead session fails fast instead of burning minutes")
+_fa_src = (pathlib.Path(ROOT) / "flow_api_headless.py").read_text(encoding="utf-8")
+check("generate() probes the page before ploughing on",
+      "is the logged-out" in _gen_src and "page_probe()" in _gen_src)
+check("...and returns immediately when the session really is gone",
+      "not attempting any RPC" in _gen_src)
+check("...but still tolerates a flaky account probe",
+      "the page still looks" in _gen_src)
+check("a logged-out page stops the token wait early",
+      "will NEVER grow a token" in inspect.getsource(FH.HeadlessEngine._wait_at))
+
+# the message must actually reach the heal path, or none of the above is useful
+_m = re.search(r"def _looks_like_dead_session.*?return any\(k in low for k in \((.*?)\)\)",
+               _fa_src, re.S)
+_keys = re.findall(r'"([^"]+)"', _m.group(1)) if _m else []
+check("the heal classifier's keywords were located (test is meaningful)",
+      len(_keys) >= 5, str(_keys))
+_MSG = ("session check failed and the page is the logged-out surface "
+        "(https://flow.google.com/about) — requesting heal")
+check("the fast-fail message matches a dead-session keyword",
+      any(k in _MSG.lower() for k in _keys), f"{_keys} vs {_MSG!r}")
+
+# and the wait itself must return at once, not after the whole budget
+_about = type("P", (), {"url": "https://flow.google.com/about",
+                        "evaluate": lambda s, e, *a, **k: ""})()
+_eng7 = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng7.page = _about
+_eng7._at = ""
+_eng7._live_at = ""
+_eng7._pump = lambda seconds=5: None
+_t0 = time.time()
+_r = _eng7._wait_at(timeout=60)
+_dt = time.time() - _t0
+check("the token wait gives up on a logged-out page immediately",
+      _r == "" and _dt < 5, f"returned {_r!r} after {_dt:.1f}s (budget was 60s)")
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)
