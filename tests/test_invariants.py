@@ -860,6 +860,16 @@ check("...and proves the queue drained before the composer is trusted",
       '_p.evaluate("1"' in _type_src)
 check("typing pace is now explicit, not an accident of round-trips",
       "TYPE_DELAY_MS" in _gen_src and hasattr(FH, "TYPE_DELAY_MS"))
+# With the round-trips gone, `typed=` was still ~9.4s — dominated by hardcoded
+# settle sleeps (2 + 1 + 1.5s of pure waiting). The 1.5s one is now an actual
+# check, which is both faster and catches dropped keystrokes.
+check("the prompt is VERIFIED in the composer before submitting",
+      "composer holds" in _gen_src
+      and _gen_src.index("composer holds") < _gen_src.index('press("Enter")'))
+check("...replacing the fixed 1.5s hope with a real check",
+      "time.sleep(1.5)" not in _gen_src)
+check("the post-composer settle is no longer 2s of dead waiting",
+      "_pump(seconds=2)" not in _gen_src)
 check("...and is tunable without a deploy",
       "FLOW_TYPE_DELAY_MS" in
       (pathlib.Path(ROOT) / "flow_headless.py").read_text(encoding="utf-8"))

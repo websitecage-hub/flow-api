@@ -1786,7 +1786,9 @@ class HeadlessEngine:
         _mark("nav")
         self._wait_composer()
         _mark("composer")
-        self._pump(seconds=2)
+        # 2s of "let it settle" was pure waiting: the composer has already been
+        # polled for and confirmed present, so there is nothing left to wait for.
+        self._pump(seconds=0.5)
         caught = []
 
         def _on(resp):
@@ -1874,7 +1876,7 @@ class HeadlessEngine:
                              "WITH its watermark. Set FLOW_ASPECT_PROMPT=1 to "
                              "test a new size.")
             box.click()
-            time.sleep(1)
+            time.sleep(0.3)
             # clear any leftover text
             try:
                 self.page.keyboard.press("ControlOrMeta+a")
@@ -1887,7 +1889,26 @@ class HeadlessEngine:
             # only because every character paid a CDP round-trip; the speedup
             # removed the round-trips, so the delay now has to be explicit.
             self.page.keyboard.type(prompt, delay=TYPE_DELAY_MS)
-            time.sleep(1.5)
+            # VERIFY the text landed, instead of hoping a fixed sleep was long
+            # enough. This is faster (no 1.5s guess) and safer: a prompt that
+            # did not land used to submit an empty request and surface minutes
+            # later as "ogiZ0b response had no media", which looks like a
+            # Google-side flake rather than our own dropped keystrokes.
+            try:
+                want = prompt.strip()[:14]
+                got = self.page.evaluate(
+                    "(() => {const e=document.querySelector("
+                    "'[contenteditable=\"true\"]');"
+                    "return e ? (e.textContent || '') : '';})()") or ""
+                if want and want not in got:
+                    _log(f"[*] generate: composer holds {len(got)} chars, "
+                         f"expected {want!r} — retyping once")
+                    self.page.keyboard.press("ControlOrMeta+a")
+                    self.page.keyboard.press("Backspace")
+                    self.page.keyboard.type(prompt, delay=TYPE_DELAY_MS)
+            except Exception:
+                pass
+            time.sleep(0.5)
             self.page.keyboard.press("Enter")
             _mark("typed")
             deadline = time.time() + RESPONSE_TIMEOUT
