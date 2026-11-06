@@ -677,6 +677,93 @@ check("'/about' short-circuits before the reload",
 check("the fast path explains itself in the log",
       "session looks logged out) —" in _fh)
 
+# ── 19. aspect ratio is a PROJECT SETTING, not a request field ─────────────
+# Every image came back 16:9 however the API was called. Cause: aspect is a
+# per-project UI setting behind the composer's settings gear, and our headless
+# path never drove it (it wrote request[4], which Flow ignores). Recipe mapped
+# from gflow-cli (MIT) ui_automation.py:2450 / ui_automation_video.py:123.
+print("\n[19] aspect ratio is driven in the UI, not the payload")
+_fh_src = (pathlib.Path(ROOT) / "flow_headless.py").read_text(encoding="utf-8")
+_gen_src = inspect.getsource(FH.HeadlessEngine.generate)
+
+check("a `crop_*` trigger probe exists",
+      hasattr(FH, "JS_ASPECT_TRIGGER") and "crop_" in FH.JS_ASPECT_TRIGGER)
+check("the trigger probe requires an exact crop_ ligature",
+      "/^crop_/" in FH.JS_ASPECT_TRIGGER)
+check("a tab scanner exists", hasattr(FH, "JS_UI_TABS"))
+check("the ratio tab labels cover the ratios we accept",
+      all(r in FH._ASPECT_TAB_LABELS for r in ("16:9", "9:16", "1:1", "4:3", "3:4")))
+check("1:1 accepts its locale variants (Square / 1x1)",
+      "Square" in FH._ASPECT_TAB_LABELS["1:1"]
+      and any("1×1" == x for x in FH._ASPECT_TAB_LABELS["1:1"]))
+check("the settings trigger is found via its icon, locale-independent",
+      "google-symbols" in FH.JS_ASPECT_TRIGGER)
+check("only unambiguous icons are used to skip a click",
+      set(FH._ASPECT_ICON_UNIQUE) == {"crop_16_9", "crop_9_16", "crop_square"})
+check("engine has set_aspect_ratio()", hasattr(FH.HeadlessEngine, "set_aspect_ratio"))
+check("the picker is dismissed, and only by Escape (never a stray click)",
+      "Escape" in inspect.getsource(FH.HeadlessEngine._close_settings))
+check("generate() sets the aspect BEFORE typing the prompt",
+      "set_aspect_ratio" in _gen_src
+      and _gen_src.index("set_aspect_ratio") < _gen_src.index("box.click()"))
+check("...and only when one was actually requested",
+      "if aspect:" in _gen_src)
+check("a failure is caught so it can never break generation",
+      "continuing with the \"\n                         f\"project default"
+      in _gen_src or "project default" in _gen_src)
+check("the probe reports the trigger icon so /diag shows the live ratio",
+      "crops:" in _fh_src)
+
+
+class _AspectPage:
+    """Browser-free page stub: scripted trigger + tabs, recorded clicks."""
+
+    def __init__(self, trigger=None, tabs=None):
+        self._trigger = trigger or {}
+        self._tabs = tabs or []
+        self.clicks = []
+        self.presses = []
+        self.keyboard = self
+
+    def press(self, key):
+        self.presses.append(key)
+
+    def evaluate(self, expr, *a, **k):
+        return ([self._trigger] if self._trigger else []) if "crop_" in expr \
+            else list(self._tabs)
+
+    def mouse_click(self, x, y):
+        self.clicks.append((x, y))
+
+
+_eng = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng.page = _AspectPage(trigger={"icon": "crop_16_9", "x": 10, "y": 20,
+                                 "label": "Frame"})
+check("an already-correct ratio is a no-op", _eng.set_aspect_ratio("16:9") is True)
+check("...it clicked nothing", _eng.page.clicks == [], str(_eng.page.clicks))
+
+_eng2 = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng2.page = _AspectPage(tabs=[{"text": "1:1", "x": 5, "y": 6, "sel": ""}])
+check("no `crop_*` trigger (Agent arm) degrades safely instead of clicking",
+      _eng2.set_aspect_ratio("1:1") is False and _eng2.page.clicks == [])
+
+_eng3 = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng3.page = _AspectPage(
+    trigger={"icon": "crop_landscape", "x": 1, "y": 2, "label": "Frame"},
+    tabs=[{"text": "16:9", "x": 3, "y": 4, "sel": "true"},
+          {"text": "1:1", "x": 5, "y": 6, "sel": "false"}])
+check("an ambiguous icon drives the picker (16:9 and 4:3 share one icon)",
+      _eng3.set_aspect_ratio("1:1") is True)
+check("...clicking the trigger then the ratio tab",
+      len(_eng3.page.clicks) == 2, str(_eng3.page.clicks))
+check("...then dismissing the picker", _eng3.page.presses == ["Escape"])
+
+_eng4 = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng4.page = _AspectPage(trigger={"icon": "crop_square", "x": 1, "y": 2, "label": ""},
+                         tabs=[{"text": "16:9", "x": 3, "y": 4, "sel": ""}])
+check("a ratio the picker does not expose is refused, not guessed",
+      _eng4.set_aspect_ratio("7:5") is False and _eng4.page.clicks == [])
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

@@ -166,6 +166,73 @@ DEFAULT_MODEL = "BELUGA"
 ASPECT_WIRE = {"1:1": 1, "9:16": 2, "16:9": 3, "3:4": 4, "4:3": 5,
                "3:2": 6, "2:3": 7, "4:5": 8, "5:4": 9, "21:9": 10}
 
+# ── aspect ratio is a PROJECT SETTING, not a request field ─────────────────
+# Flow keeps model tier, aspect ratio and output count as per-PROJECT globals
+# behind the composer's settings gear: set once, they persist across turns.
+# Writing the enum into the request payload does NOT change the output — which
+# is exactly why every image came back 16:9 no matter what /generate was asked
+# for (request[4] was set and silently ignored).
+#
+# Recipe mapped from gflow-cli (MIT, ffroliva) api/transports/ui_automation.py
+# — `_apply_aspect_ratio` at :2450 and `MODE_SWITCH_TRIGGER_SELECTORS` at
+# ui_automation_video.py:123 — then translated to plain JS because our driver's
+# Locator only speaks CSS (no Playwright `:has()` / `:text-is()`):
+#   trigger = a button carrying a google-symbols ligature `crop_*` (the icon
+#             also REVEALS the current ratio, and it is locale-independent)
+#   choice  = [role=tab] whose exact text is the ratio ("16:9", "9:16", "1:1"…)
+# The tabs are NOT in the DOM until the trigger is clicked.
+#
+# crop_landscape/crop_portrait are shared by two ratios each, so the icon alone
+# cannot prove which is selected; only the unambiguous three are used to skip.
+_ASPECT_ICON = {"16:9": ("crop_16_9", "crop_landscape"),
+                "4:3": ("crop_landscape",),
+                "9:16": ("crop_9_16", "crop_portrait"),
+                "3:4": ("crop_portrait",),
+                "1:1": ("crop_square",),
+                "21:9": ("crop_original",)}
+_ASPECT_ICON_UNIQUE = {"crop_16_9": "16:9", "crop_9_16": "9:16",
+                       "crop_square": "1:1"}
+# Tab labels to try, in order. "1:1" is sometimes rendered "Square" or with a
+# multiplication sign (U+00D7) rather than a colon.
+_ASPECT_TAB_LABELS = {"16:9": ("16:9",), "9:16": ("9:16",),
+                      "1:1": ("1:1", "1×1", "1x1", "Square"),
+                      "4:3": ("4:3",), "3:4": ("3:4",), "21:9": ("21:9",)}
+
+# Find the settings trigger: any button whose google-symbols ligature is
+# `crop_*`. Returns its centre point plus the icon (i.e. the current ratio).
+JS_ASPECT_TRIGGER = """() => {
+  const out = [];
+  for (const b of document.querySelectorAll('button,[role=button]')) {
+    const i = b.querySelector('i.google-symbols, i.material-symbols-outlined, i');
+    const lig = i ? (i.textContent || '').trim() : '';
+    if (!/^crop_/.test(lig)) continue;
+    const r = b.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    out.push({icon: lig, x: r.x + r.width / 2, y: r.y + r.height / 2,
+              w: r.width, h: r.height,
+              label: (b.getAttribute('aria-label') ||
+                      b.getAttribute('title') || '').slice(0, 70)});
+  }
+  return out;
+}"""
+
+# Every visible tab-ish control — used to find the ratio choice, and (on a
+# miss) to log what the panel ACTUALLY offers instead of guessing again.
+JS_UI_TABS = """() => {
+  const out = [];
+  const sel = "[role=tab],[role=radio],[role=menuitemradio],[role=menuitem]";
+  for (const t of document.querySelectorAll(sel)) {
+    const r = t.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    out.push({text: (t.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 30),
+              role: t.getAttribute('role') || '',
+              sel: t.getAttribute('aria-selected') ||
+                   t.getAttribute('aria-checked') || '',
+              x: r.x + r.width / 2, y: r.y + r.height / 2});
+  }
+  return out;
+}"""
+
 
 def norm_model(name):
     """Human/model name -> wire code. Accepts wire codes unchanged.
@@ -888,6 +955,16 @@ class HeadlessEngine:
                     '[contenteditable="true"]').length,
                 buttons: document.querySelectorAll('button,[role=button]').length,
                 html_len: document.documentElement.innerHTML.length,
+                // The composer's settings trigger, if this UI arm has one.
+                // `crop_*` is the locale-independent marker AND it reports
+                // which ratio the project is currently set to.
+                crops: Array.from(document.querySelectorAll('i')).map(
+                    e => (e.textContent || '').trim())
+                    .filter(t => /^crop_/.test(t)).slice(0, 6),
+                // what the settings panel offers (empty until it is opened)
+                tabs: Array.from(document.querySelectorAll('[role=tab]')).map(
+                    t => (t.textContent || '').trim().replace(/\\s+/g, ' ')
+                         .slice(0, 16)).filter(Boolean).slice(0, 12),
                 text: b.replace(/\\s+/g, ' ').trim().slice(0, 180)
               };
             }""")
@@ -1117,6 +1194,88 @@ class HeadlessEngine:
                 return t
             self._pump(seconds=1.5)
         return ""
+
+    # ── the composer's settings panel (aspect ratio lives here) ──────────
+    def _ui_aspect_trigger(self) -> dict:
+        """The settings-gear button whose `crop_*` icon shows the current
+        ratio. {} when the page has none (e.g. the composer is in Agent mode,
+        where this panel does not exist at all)."""
+        try:
+            hits = self.page.evaluate(JS_ASPECT_TRIGGER) or []
+        except Exception:
+            return {}
+        return hits[0] if hits else {}
+
+    def _ui_tabs(self) -> list:
+        try:
+            return self.page.evaluate(JS_UI_TABS) or []
+        except Exception:
+            return []
+
+    def set_aspect_ratio(self, ratio: str) -> bool:
+        """Set the project's aspect ratio by driving the composer's picker.
+
+        Aspect is a per-PROJECT setting here, not a request field: writing the
+        enum into the payload is ignored (that is why every image was 16:9).
+        Best-effort by design — a miss leaves the project default and logs what
+        the panel actually contained, because guessing selectors is how you
+        silently ship the wrong ratio.
+        """
+        want = str(ratio or "").strip()
+        if want not in _ASPECT_TAB_LABELS:
+            _log(f"[*] aspect: {want!r} is not exposed by the picker — leaving "
+                 f"the project default")
+            return False
+        try:
+            trig = self._ui_aspect_trigger()
+            if not trig:
+                _log("[!] aspect: no `crop_*` settings trigger on this page — "
+                     "the composer is likely in Agent mode, where the settings "
+                     "panel does not exist. Leaving the project default.")
+                return False
+            icon = str(trig.get("icon") or "")
+            if _ASPECT_ICON_UNIQUE.get(icon) == want:
+                _log(f"[*] aspect: already {want} (trigger icon {icon})")
+                return True
+            _log(f"[*] aspect: opening the settings picker "
+                 f"(trigger icon {icon}, current label {trig.get('label')!r})")
+            self.page.mouse_click(trig["x"], trig["y"])
+            time.sleep(1.5)
+
+            tabs = self._ui_tabs()
+            labels = [t.get("text") for t in tabs]
+            for label in _ASPECT_TAB_LABELS[want]:
+                hit = next((t for t in tabs if t.get("text") == label), None)
+                if not hit:
+                    continue
+                self.page.mouse_click(hit["x"], hit["y"])
+                time.sleep(1.0)
+                _log(f"[*] aspect: set {want} (clicked tab {label!r}, "
+                     f"was aria-selected={hit.get('sel')!r})")
+                self._close_settings()
+                return True
+            # Say what the panel really offered. Next iteration is driven by
+            # this line rather than by another guess.
+            _log(f"[!] aspect: wanted {want} but no matching tab in the picker; "
+                 f"saw {labels[:14]}")
+            self._close_settings()
+            return False
+        except Exception as e:
+            _log(f"[!] aspect: setting {want} failed: {str(e)[:140]}")
+            try:
+                self._close_settings()
+            except Exception:
+                pass
+            return False
+
+    def _close_settings(self):
+        """Dismiss the picker. Escape closes the OVERLAY without leaving the
+        composer — never click elsewhere, which can drop the typed prompt."""
+        try:
+            self.page.keyboard.press("Escape")
+            time.sleep(0.4)
+        except Exception:
+            pass
 
     def call(self, rpcid: str, payload, project_id: str = "",
              timeout_ms: int = 0, eval_timeout: float = 60):
@@ -1509,6 +1668,18 @@ class HeadlessEngine:
                         f"text={str(probe.get('text'))[:60]!r}")
                     _log(f"[!] generate: {self.last_error}")
                     return None
+            # HONOUR THE REQUESTED ASPECT RATIO. It is a per-PROJECT setting
+            # on this product, not a payload field, so it must be driven in the
+            # UI before the prompt goes in — otherwise Google applies the
+            # project default and EVERY image comes back 16:9 no matter what
+            # the caller asked for. Best-effort: a miss logs what the picker
+            # actually offered and generation continues on the default.
+            if aspect:
+                try:
+                    self.set_aspect_ratio(str(aspect))
+                except Exception as e:
+                    _log(f"[!] aspect: {str(e)[:120]} (continuing with the "
+                         f"project default)")
             box.click()
             time.sleep(1)
             # clear any leftover text
