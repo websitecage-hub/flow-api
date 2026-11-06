@@ -12,6 +12,7 @@ Run:  python tests/test_invariants.py     (or: pytest tests/)
 """
 import os
 import pathlib
+import re
 import sys
 import time
 
@@ -844,6 +845,37 @@ _e.page = _p1
 check("_composer_present() reports a warm composer", _e._composer_present() is True)
 _e.page = _p2
 check("...and fails safe (False) instead of raising", _e._composer_present() is False)
+
+# ── 22. the UI is a Flow-like shell that does not waste the worker ─────────
+# Flow's real UI is an app: tabs, a bottom prompt bar, a canvas of tiles. This
+# is the lightweight version — one file, no framework, no external requests —
+# and it must never spend the server's single worker on a tab nobody is looking
+# at.
+print("\n[22] UI shell: Flow-like, and cheap when hidden")
+_ui2 = (pathlib.Path(ROOT) / "ui" / "index.html").read_text(encoding="utf-8")
+check("it is a single file with no external scripts/fonts",
+      not re.search(r'<(script|link)[^>]+(src|href)=', _ui2))
+check("the composer is docked at the bottom (Flow's prompt bar)",
+      'class="composer"' in _ui2 and "flowjob" in _ui2)
+check("there are tabs, so secondary panels stay out of the way",
+      all(f'data-tab="{t}"' in _ui2 for t in ("create", "library", "upload", "api"))
+      and all(f'id="p-{t}"' in _ui2 for t in ("create", "library", "upload", "api")))
+check("off-screen tiles skip layout/paint work",
+      "content-visibility:auto" in _ui2)
+check("Enter generates, Shift+Enter is a newline",
+      "e.shiftKey" in _ui2 and "e.preventDefault(); go();" in _ui2)
+check("a hidden tab does not poll the library (it costs the worker)",
+      "if (HIDDEN) return;" in _ui2)
+check("...and job polling slows down while hidden",
+      "HIDDEN ? 10000" in _ui2)
+check("returning to the tab refreshes immediately",
+      "addEventListener('visibilitychange'" in _ui2)
+check("/health still polls while hidden (it keeps the service awake)",
+      "setInterval(pollHealth, 5000)" in _ui2
+      and "setInterval(pollHealth" not in _ui2.split("visibilitychange")[1])
+check("every referenced element id exists (no silent runtime null)",
+      all(i in set(re.findall(r'id="([^"]+)"', _ui2))
+          for i in set(re.findall(r"\$\$?\('#([a-zA-Z0-9_-]+)'\)", _ui2))))
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
