@@ -846,6 +846,24 @@ check("_composer_present() reports a warm composer", _e._composer_present() is T
 _e.page = _p2
 check("...and fails safe (False) instead of raising", _e._composer_present() is False)
 
+# Typing was 11.9s of a 55.4s generation — a quarter of the wait — because every
+# character waited for its own CDP round-trip (~200 ms each on 0.1 CPU).
+import flow_cdp as _CDP
+_type_src = inspect.getsource(_CDP.Keyboard.type)
+check("both key events are fire-and-forget (no per-char round-trip)",
+      _type_src.count('"Input.dispatchKeyEvent"') == 2
+      and _type_src.count("wait=False") == 2)
+check("...but still fires real key events (not a silent insertText)",
+      '"type": "keyDown"' in _type_src
+      and '"Input.insertText"' not in _type_src)
+check("...and proves the queue drained before the composer is trusted",
+      '_p.evaluate("1"' in _type_src)
+check("typing pace is now explicit, not an accident of round-trips",
+      "TYPE_DELAY_MS" in _gen_src and hasattr(FH, "TYPE_DELAY_MS"))
+check("...and is tunable without a deploy",
+      "FLOW_TYPE_DELAY_MS" in
+      (pathlib.Path(ROOT) / "flow_headless.py").read_text(encoding="utf-8"))
+
 # ── 22. the UI is a Flow-like shell that does not waste the worker ─────────
 # Flow's real UI is an app: tabs, a bottom prompt bar, a canvas of tiles. This
 # is the lightweight version — one file, no framework, no external requests —

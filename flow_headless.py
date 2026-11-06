@@ -91,6 +91,13 @@ RESPONSE_TIMEOUT = int(os.environ.get("FLOW_RESPONSE_TIMEOUT", "240"))
 # and a full browser rebuild. Waiting is far cheaper than that recovery.
 AT_WAIT_S = int(os.environ.get("FLOW_AT_WAIT_S", "60"))
 
+# Per-character typing delay. This is the one pace we set on purpose: keystroke
+# cadence is a behavioural signal to reCAPTCHA Enterprise, and the old value was
+# only "human" by accident (every character paid a ~200 ms CDP round-trip).
+# Now the round-trips are gone, so the delay is stated outright. 25 ms keeps a
+# prompt of ~55 characters near 1.5 s instead of 12 s.
+TYPE_DELAY_MS = int(os.environ.get("FLOW_TYPE_DELAY_MS", "25"))
+
 
 def _proxy_config():
     """Optional egress proxy for the browser, from FLOW_PROXY_URL.
@@ -1839,7 +1846,12 @@ class HeadlessEngine:
                 self.page.keyboard.press("Backspace")
             except Exception:
                 pass
-            self.page.keyboard.type(prompt, delay=15)
+            # Pacing is deliberate, not incidental: these requests are scored by
+            # reCAPTCHA Enterprise and keystroke cadence is a behavioural
+            # signal. The old code was accidentally human-like (~216 ms/char)
+            # only because every character paid a CDP round-trip; the speedup
+            # removed the round-trips, so the delay now has to be explicit.
+            self.page.keyboard.type(prompt, delay=TYPE_DELAY_MS)
             time.sleep(1.5)
             self.page.keyboard.press("Enter")
             _mark("typed")

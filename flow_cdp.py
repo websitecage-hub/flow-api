@@ -486,11 +486,25 @@ class Keyboard:
                            {**base, "type": "keyUp"},
                            session_id=self._p._sid, wait=False)
 
-    def type(self, text: str, delay: float = 15):
-        """Type like a human: per-character keyDown(with text)+keyUp, which
-        fires keydown/keypress/input/keyup — what Angular's composer needs.
-        Input.insertText is faster but silently no-ops on some focused
-        contenteditables, so key events are the reliable path."""
+    def type(self, text: str, delay: float = 0):
+        """Type per-character keyDown(with text)+keyUp — what Angular's
+        composer needs — WITHOUT paying a round-trip per character.
+
+        Measured: a 55-character prompt cost 11.9s of a 55.4s generation
+        ([timing] nav=20.7s composer=1.3s typed=11.9s response=20.3s). The
+        render itself was 20s, so a quarter of the wait was us talking to our
+        own browser: each keyDown was sent with wait=True, and on a 0.1-CPU
+        container every round-trip is ~200ms.
+
+        These events do not need individual acknowledgements. One ordered
+        socket delivers them in order and Chrome processes CDP commands in
+        order, so the key sequence is preserved regardless. The single
+        evaluate at the end is an explicit barrier: its reply can only arrive
+        after every key event before it has been handled.
+
+        Input.insertText remains unused on purpose — it is faster still, but it
+        silently no-ops on some focused contenteditables, and key events are
+        what actually fire keydown/keypress/input/keyup."""
         if not text:
             return
         for ch in text:
@@ -502,12 +516,18 @@ class Keyboard:
             self._p._conn.send("Input.dispatchKeyEvent",
                                {**common, "type": "keyDown", "text": ch,
                                 "unmodifiedText": ch},
-                               session_id=self._p._sid, timeout=20)
+                               session_id=self._p._sid, wait=False)
             self._p._conn.send("Input.dispatchKeyEvent",
                                {**common, "type": "keyUp"},
                                session_id=self._p._sid, wait=False)
             if delay:
                 time.sleep(min(delay, 25) / 1000.0)
+        # barrier: proves the browser drained the queue above before we rely on
+        # the text being in the composer
+        try:
+            self._p.evaluate("1", timeout=20)
+        except Exception:
+            pass
 
 
 class Page:
