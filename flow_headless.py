@@ -983,6 +983,15 @@ class HeadlessEngine:
              el.getAttribute('aria-disabled') !== 'true';
     }"""
 
+    def _composer_present(self) -> bool:
+        """Is a usable composer ALREADY in the DOM? One evaluate, no waiting.
+        This is the state check that lets a warm page be reused rather than
+        reloaded — the difference between "instant" and a full SPA reload."""
+        try:
+            return bool(self.page.evaluate(self.COMPOSER_JS))
+        except Exception:
+            return False
+
     def page_probe(self) -> dict:
         """What the page ACTUALLY is right now.
 
@@ -1663,34 +1672,78 @@ class HeadlessEngine:
             _log("[*] generate: session check failed — continuing without "
                  "restart (mid-job restart kills the page)")
             self.last_error = ""
+        # ── TIMING ────────────────────────────────────────────────────────
+        # "Make it faster" is guesswork without this. The render itself is
+        # Google's and cannot be optimised, but navigation, hydration, the
+        # composer wait and typing are OURS — and on a 0.1-CPU container those
+        # are where a real SPA is usually already warm and we are not.
+        _T = {"t0": time.time()}
+
+        def _mark(k):
+            _T[k] = time.time()
+
+        def _timing():
+            prev = _T["t0"]
+            bits = []
+            for k in ("project", "nav", "composer", "typed", "response"):
+                if k in _T:
+                    bits.append(f"{k}={_T[k] - prev:.1f}s")
+                    prev = _T[k]
+            bits.append(f"total={time.time() - _T['t0']:.1f}s")
+            _log("[timing] generate " + " ".join(bits))
+
         pid = self.ensure_project(project_id)
+        _mark("project")
         if not pid:
             _log("[!] generate: no project id")
+            _timing()
             return None
-        self.goto_app(f"/project/{pid}")
-        # 404? the stored project id is stale/deleted -> auto-create a fresh one
+        # ── WARM PATH ─────────────────────────────────────────────────────
+        # Real Flow feels instant because its SPA is ALREADY loaded. We were
+        # fully re-navigating — page load, then Angular hydration, then the
+        # composer wait — on EVERY generation, which on a 0.1-CPU container is
+        # the largest avoidable cost in the whole pipeline. If the page already
+        # sits on this project with a usable composer, reuse it. This is the
+        # same "read the state, don't blindly act" rule gflow-cli's mode
+        # control applies (`ensure_media_mode` checks aria-pressed rather than
+        # toggling). A stale page is not a trap: a miss here still ends in the
+        # composer check and the existing self-heal.
+        warm = False
         try:
-            self._pump(seconds=3)
-            if "404" in (self.page.url or ""):
-                _log(f"[*] generate: project {pid} is 404 -> creating a new one")
-                pid = self.create_project()
-                if not pid:
-                    self.last_error = "project 404 and auto-create failed"
-                    return None
-                try:
-                    st = load_state()
-                    st["project_id"] = pid
-                    save_state(st)
-                except Exception:
-                    pass
-                self.goto_app(f"/project/{pid}")
+            warm = (f"/project/{pid}" in (self.page.url or "")
+                    and self._composer_present())
         except Exception:
-            pass
+            warm = False
+        if warm:
+            _log("[*] generate: page already warm on this project — reusing it, "
+                 "no navigation")
+        else:
+            self.goto_app(f"/project/{pid}")
+            # 404? stale/deleted project id -> auto-create a fresh one
+            try:
+                self._pump(seconds=3)
+                if "404" in (self.page.url or ""):
+                    _log(f"[*] generate: project {pid} is 404 -> creating a new one")
+                    pid = self.create_project()
+                    if not pid:
+                        self.last_error = "project 404 and auto-create failed"
+                        return None
+                    try:
+                        st = load_state()
+                        st["project_id"] = pid
+                        save_state(st)
+                    except Exception:
+                        pass
+                    self.goto_app(f"/project/{pid}")
+            except Exception:
+                pass
         # Poll for the composer instead of a fixed sleep: Angular hydration is
         # slow on Render free's 0.1 CPU (and on a cold project page), so a 6 s
         # sleep often finds an empty DOM and wrongly reports "not logged in".
         # First load after a fresh login is the slow case (up to ~2 min).
+        _mark("nav")
         self._wait_composer()
+        _mark("composer")
         self._pump(seconds=2)
         caught = []
 
@@ -1789,6 +1842,7 @@ class HeadlessEngine:
             self.page.keyboard.type(prompt, delay=15)
             time.sleep(1.5)
             self.page.keyboard.press("Enter")
+            _mark("typed")
             deadline = time.time() + RESPONSE_TIMEOUT
             while time.time() < deadline and not caught:
                 try:
@@ -1801,6 +1855,8 @@ class HeadlessEngine:
                 self.page.remove_listener("response", _on)
             except Exception:
                 pass
+        _mark("response")
+        _timing()
         if not caught:
             self.last_error = "no ogiZ0b response observed (page slow/wedged?)"
             _log(f"[!] generate: {self.last_error}")

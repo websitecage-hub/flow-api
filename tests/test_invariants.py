@@ -811,6 +811,40 @@ _o2, _c2 = _eng6._aspect_via_prompt("1:1", "a red apple")
 check("no detectable arm leaves the prompt untouched",
       _o2 == "a red apple" and _c2 == "")
 
+# ── 21. speed: measure it, then stop re-loading the SPA ────────────────────
+# "Make it faster" without a breakdown is guesswork. The render is Google's and
+# cannot be optimised; navigation + hydration + the composer wait are OURS, and
+# real Flow feels instant because its SPA is ALREADY loaded — we re-navigated
+# on every single generation.
+print("\n[21] speed: stage timings + the warm-page path")
+check("generation records stage timings",
+      "_T" in _gen_src and "_mark(" in _gen_src)
+check("...and logs one line per generation",
+      "[timing] generate" in _gen_src)
+check("the stages named are the ones we can actually influence",
+      all(k in _gen_src for k in ('_mark("project")', '_mark("nav")',
+                                  '_mark("composer")', '_mark("typed")',
+                                  '_mark("response")')))
+check("an engine can ask 'is the composer already here?'",
+      hasattr(FH.HeadlessEngine, "_composer_present"))
+check("...reusing the same composer predicate the wait uses",
+      "COMPOSER_JS" in inspect.getsource(FH.HeadlessEngine._composer_present))
+check("a warm page is reused instead of reloaded",
+      "warm = " in _gen_src and "no navigation" in _gen_src)
+check("the reload is now the ELSE branch, not the default",
+      _gen_src.index("if warm:") < _gen_src.index("self.goto_app(f\"/project/{pid}\")"
+                                                  if 'self.goto_app(f"/project/{pid}")' in _gen_src
+                                                  else "self.goto_app("))
+
+_p1 = type("P", (), {"evaluate": lambda s, e, *a, **k: True})()
+_p2 = type("P", (), {"evaluate": lambda s, e, *a, **k: (_ for _ in ()).throw(
+    RuntimeError("boom"))})()
+_e = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_e.page = _p1
+check("_composer_present() reports a warm composer", _e._composer_present() is True)
+_e.page = _p2
+check("...and fails safe (False) instead of raising", _e._composer_present() is False)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)
