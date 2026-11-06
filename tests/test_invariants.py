@@ -764,6 +764,53 @@ _eng4.page = _AspectPage(trigger={"icon": "crop_square", "x": 1, "y": 2, "label"
 check("a ratio the picker does not expose is refused, not guessed",
       _eng4.set_aspect_ratio("7:5") is False and _eng4.page.clicks == [])
 
+# ── 20. the agent arm, and why its fallback is OFF by default ──────────────
+# Confirmed live: our page has no `crop_*` panel — it is the AGENT arm, where
+# the ratio rides in the PROMPT ("...in a 1:1 aspect ratio"), as gflow-cli's
+# agentic driver does ("Settings via prompt, not the tune popover"). That
+# fallback must stay DISABLED until the watermark remover can handle a size
+# other than 1376x768, or enabling it would serve WATERMARKED images.
+print("\n[20] agent arm: prompt clause, gated off until the mark is mapped")
+check("the prompt clause exists for the ratios we accept",
+      all(r in FH.ASPECT_CLAUSE for r in ("16:9", "9:16", "1:1", "4:3", "3:4")))
+check("the clause reads naturally", "aspect ratio" in FH.ASPECT_CLAUSE["1:1"])
+check("an agent-arm detector exists", hasattr(FH.HeadlessEngine, "_agent_arm"))
+check("it looks for the `tune` gear (their AGENT_TUNE_INDICATOR)",
+      "'tune'" in FH.JS_AGENT_ARM)
+check("it also looks for the agent composer element",
+      "flow-creative-agent-prompt-box" in FH.JS_AGENT_ARM)
+check("the fallback is OFF by default", FH.aspect_prompt_enabled() is False)
+os.environ["FLOW_ASPECT_PROMPT"] = "1"
+check("...and can be switched on to test a new size",
+      FH.aspect_prompt_enabled() is True)
+os.environ.pop("FLOW_ASPECT_PROMPT", None)
+check("generate() consults the gate rather than applying it blindly",
+      "aspect_prompt_enabled()" in _gen_src)
+check("the off-state explains itself in the log (not a silent no-op)",
+      "WITH its watermark" in _gen_src)
+check("the remover makes a size it cannot handle LOUD",
+      "watermark NOT removed" in (pathlib.Path(ROOT) /
+                                  "dewatermark_server.py").read_text(encoding="utf-8"))
+
+# the clause is appended only when an agent arm is actually detected
+_eng5 = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng5.page = _AspectPage()
+_eng5.page._agent_arm_result = {"tune": True, "agent_box": False, "crop": ""}
+_eng5.page.evaluate = lambda expr, *a, **k: (
+    _eng5.page._agent_arm_result if "tune" in expr else [])
+_out, _cl = _eng5._aspect_via_prompt("1:1", "a red apple")
+check("an agent arm appends the clause to the prompt",
+      _out == "a red apple, in a square 1:1 aspect ratio", _out)
+check("...and reports which clause it used", _cl != "")
+
+_eng6 = FH.HeadlessEngine.__new__(FH.HeadlessEngine)
+_eng6.page = _AspectPage()
+_eng6.page.evaluate = lambda expr, *a, **k: {"tune": False, "agent_box": False,
+                                             "ligature": "abc"}
+_o2, _c2 = _eng6._aspect_via_prompt("1:1", "a red apple")
+check("no detectable arm leaves the prompt untouched",
+      _o2 == "a red apple" and _c2 == "")
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

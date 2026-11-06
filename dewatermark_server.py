@@ -99,6 +99,13 @@ def clean_bytes(blob: bytes, quality: int = 85) -> bytes:
         from PIL import Image
         im = Image.open(io.BytesIO(blob))
         if im.size != SIZE:
+            # NOT a calibrated size, so we cannot remove the mark — and
+            # returning the bytes untouched means serving a WATERMARKED image.
+            # That used to happen silently, which is how a size change would
+            # quietly break the promise that everything is watermark-free. Say
+            # it out loud instead.
+            print(f"[media] watermark NOT removed: {im.size[0]}x{im.size[1]} is "
+                  f"not the calibrated {SIZE[0]}x{SIZE[1]} render", flush=True)
             return blob
         im = im.convert("RGB")
         px = im.load()

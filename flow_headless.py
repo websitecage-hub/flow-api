@@ -216,6 +216,58 @@ JS_ASPECT_TRIGGER = """() => {
   return out;
 }"""
 
+# ── the OTHER arm: settings via the prompt ─────────────────────────────────
+# Our live page turns out to be the AGENT arm, where the `crop_*` settings
+# panel does not exist at all (confirmed live: "no `crop_*` settings trigger",
+# output still 1376x768). There, aspect and model are requested in the PROMPT
+# as a natural-language clause, and only the output count uses the settings
+# popover — policy stated outright in gflow-cli's agentic driver
+# ("Settings via prompt, not the tune popover") and implemented in
+# drivers/agentic.py `_compose_directive`, whose template is
+#   "Make me a picture of {prompt}[ in a {aspect} aspect ratio]."
+# The agent-arm markers are a `tune` ligature (the agent settings gear,
+# drivers/factory.py AGENT_TUNE_INDICATOR_SELECTOR) and/or a
+# <flow-creative-agent-prompt-box> composer element.
+ASPECT_CLAUSE = {"16:9": "in a 16:9 aspect ratio",
+                 "9:16": "in a 9:16 aspect ratio",
+                 "1:1": "in a square 1:1 aspect ratio",
+                 "4:3": "in a 4:3 aspect ratio",
+                 "3:4": "in a 3:4 aspect ratio"}
+
+
+def aspect_prompt_enabled() -> bool:
+    """Is the agent-arm prompt clause permitted?
+
+    OFF by default, deliberately. Requesting a ratio we cannot yet de-watermark
+    would serve a WATERMARKED image — that is worse than ignoring the ratio,
+    because "everything served is watermark-free" is the guarantee users build
+    on. dewatermark_server is calibrated only for the 1376x768 render, so this
+    stays off until the mark is mapped for the other output sizes. Flip
+    FLOW_ASPECT_PROMPT=1 to test a new size.
+    """
+    return os.environ.get("FLOW_ASPECT_PROMPT", "").strip().lower() in (
+        "1", "on", "true", "yes")
+
+
+JS_AGENT_ARM = """() => {
+  const lig = (sel) => {
+    for (const i of document.querySelectorAll(sel)) {
+      const t = (i.textContent || '').trim();
+      if (t) return t;
+    }
+    return '';
+  };
+  let tune = false, crop = '';
+  for (const i of document.querySelectorAll('i.google-symbols, i.material-symbols-outlined, i')) {
+    const t = (i.textContent || '').trim();
+    if (t === 'tune') tune = true;
+    if (/^crop_/.test(t) && !crop) crop = t;
+  }
+  return {tune: tune, crop: crop,
+          agent_box: !!document.querySelector('flow-creative-agent-prompt-box'),
+          ligature: lig('i.google-symbols')};
+}"""
+
 # Every visible tab-ish control — used to find the ratio choice, and (on a
 # miss) to log what the panel ACTUALLY offers instead of guessing again.
 JS_UI_TABS = """() => {
@@ -1212,6 +1264,34 @@ class HeadlessEngine:
         except Exception:
             return []
 
+    def _agent_arm(self) -> dict:
+        """Which composer arm this page is: the classic one (a `crop_*`
+        settings panel) or the agent one (a `tune` gear, where settings ride
+        in the prompt instead). {} when the probe fails."""
+        try:
+            return self.page.evaluate(JS_AGENT_ARM) or {}
+        except Exception:
+            return {}
+
+    def _aspect_via_prompt(self, aspect: str, prompt: str) -> tuple:
+        """Agent arm: request the ratio as a prompt clause. Returns
+        (prompt, clause_or_empty). ADVISORY — the agent can ignore it, which
+        is why the delivered size is verified separately rather than assumed."""
+        clause = ASPECT_CLAUSE.get(str(aspect or "").strip(), "")
+        if not clause:
+            return prompt, ""
+        arm = self._agent_arm()
+        if arm.get("tune") or arm.get("agent_box"):
+            _log(f"[*] aspect: agent arm detected (tune gear="
+                 f"{arm.get('tune')}, agent_box={arm.get('agent_box')}) — "
+                 f"requesting {aspect} IN THE PROMPT: {clause!r}. Advisory; "
+                 f"the delivered size is what counts.")
+            return f"{prompt.rstrip().rstrip('.')}, {clause}", clause
+        _log(f"[!] aspect: neither a `crop_*` settings panel nor an agent "
+             f"`tune` gear was found (icons seen: {arm.get('ligature')!r}) — "
+             f"{aspect} cannot be applied on this page")
+        return prompt, ""
+
     def set_aspect_ratio(self, ratio: str) -> bool:
         """Set the project's aspect ratio by driving the composer's picker.
 
@@ -1675,11 +1755,29 @@ class HeadlessEngine:
             # the caller asked for. Best-effort: a miss logs what the picker
             # actually offered and generation continues on the default.
             if aspect:
+                applied = False
                 try:
-                    self.set_aspect_ratio(str(aspect))
+                    applied = self.set_aspect_ratio(str(aspect))
                 except Exception as e:
                     _log(f"[!] aspect: {str(e)[:120]} (continuing with the "
                          f"project default)")
+                if not applied:
+                    # classic arm unavailable -> this is the agent arm, where
+                    # the ratio is requested in the prompt (advisory).
+                    if aspect_prompt_enabled():
+                        try:
+                            prompt, _clause = self._aspect_via_prompt(
+                                str(aspect), prompt)
+                        except Exception as e:
+                            _log(f"[!] aspect: prompt-clause fallback failed: "
+                                 f"{str(e)[:120]}")
+                    else:
+                        _log("[*] aspect: not applied on this arm — and the "
+                             "agent-arm prompt fallback is OFF, because "
+                             "dewatermark_server is calibrated only for the "
+                             "1376x768 render and another size would be served "
+                             "WITH its watermark. Set FLOW_ASPECT_PROMPT=1 to "
+                             "test a new size.")
             box.click()
             time.sleep(1)
             # clear any leftover text
