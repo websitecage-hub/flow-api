@@ -1025,6 +1025,38 @@ if _fa_ok:
     check("...and the rebuild is still there as the fallback",
           "if not restored:" in _fa_src2 and "hard_rebuild(boot=True)" in _fa_src2)
 
+# ── 26. exactly ONE rotator for PSIDTS ─────────────────────────────────────
+# Two writers for one cookie family sign the session out: our HTTP rotation and
+# the browser's own both rewrite __Secure-1PSIDTS in different contexts, and
+# whichever Google rejects takes the whole login with it (page ->
+# accounts.google.com). Deaths tracked the server rotate's ~5-minute cadence
+# while a harvest of the BROWSER's rotation was being adopted successfully just
+# minutes earlier — so the browser wins and the server defers.
+print("\n[26] one rotator only: the browser rotates, the server follows")
+if _fa_ok:
+    check("the engine is asked whether it can rotate for us",
+          hasattr(_FA.FlowAPI, "_server_should_rotate"))
+    _a = _FA.FlowAPI.__new__(_FA.FlowAPI)
+    _a.engine = type("E", (), {"ctx": object()})()
+    check("with a live browser the server does NOT rotate",
+          _a._server_should_rotate() is False)
+    _a.engine = None
+    check("with no browser the server does rotate (HTTP-only mode)",
+          _a._server_should_rotate() is True)
+    _a.engine = type("E", (), {"ctx": None})()
+    check("a dead browser counts as no browser", _a._server_should_rotate() is True)
+
+    _fa_src3 = (pathlib.Path(ROOT) / "flow_api_headless.py").read_text(
+        encoding="utf-8")
+    check("every periodic rotation is gated on it",
+          _fa_src3.count("if self._server_should_rotate():") >= 2,
+          str(_fa_src3.count("if self._server_should_rotate():")))
+    check("the harvest still runs whenever the session is healthy",
+          'harvest_browser_cookies("supervisor")' in _fa_src3)
+    check("the 401 recovery path may still force a rotation (already dead, so it"
+          " cannot kill a healthy session)",
+          "AUTH.rotate(force=True)" in _fa_src3)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

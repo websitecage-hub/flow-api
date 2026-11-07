@@ -624,6 +624,28 @@ class FlowAPI:
             "401", "403", "logged out", "no project id", "create_project",
             "session", "no at token", "cookie", "unauthenticated"))
 
+    def _server_should_rotate(self) -> bool:
+        """Should the SERVER rotate PSIDTS — or is the browser already doing it?
+
+        Two writers for one cookie family sign the session out. Our HTTP
+        rotation and the browser's own both rewrite __Secure-1PSIDTS, in
+        different contexts, and the value Google rejects takes the whole login
+        with it — the page then lands on accounts.google.com. Measured: deaths
+        tracked this call's ~5-minute cadence almost exactly, while a harvest of
+        the browser's OWN rotation was being adopted successfully minutes
+        before each one. So the browser is the single source of truth, and the
+        server rotates only when there is no browser to do it (HTTP-only mode).
+
+        The forced rotation in credits() is deliberately NOT gated: it runs only
+        after a 401, when the session is already dead, so it cannot be the thing
+        that kills a healthy one.
+        """
+        try:
+            eng = self.engine
+            return not (eng is not None and getattr(eng, "ctx", None) is not None)
+        except Exception:
+            return True
+
     def harvest_browser_cookies(self, why=""):
         """Read the browser's LIVE cookies and let the jar adopt the rotated
         ones. Upkeep, not a critical path — never raises."""
@@ -753,13 +775,16 @@ class FlowAPI:
             try:
                 # ── pure-Python auth upkeep (no browser needed) ──
                 if AUTH.jar:
-                    AUTH.rotate()                    # ≥600s cadence internally
+                    # The BROWSER rotates PSIDTS; the server follows it. Never
+                    # both — see _server_should_rotate().
+                    if self._server_should_rotate():
+                        AUTH.rotate()                # HTTP-only: no browser
                     # THE MISSING DIRECTION. The jar only ever flowed
-                    # jar -> browser, so Google's own PSIDTS rotation (~10 min)
-                    # was invisible to us and the next re-seed wrote the stale
-                    # value back over the fresh one — killing the session. Only
-                    # harvest while the session is known good: when it is dead,
-                    # the browser is the dead party and its values are worthless.
+                    # jar -> browser, so Google's own rotation was invisible and
+                    # a re-seed wrote the stale value back over the fresh one.
+                    # Only harvest while the session is known good: when it is
+                    # dead the browser is the dead party, so its values are
+                    # worthless and adopting them would poison the jar.
                     if self.session_ok:
                         self.harvest_browser_cookies("supervisor")
                     if (time.time() - boot_ts) > 120:
@@ -1201,10 +1226,13 @@ class FlowAPI:
 
     def _generate_attempt(self, prompt, model, aspect, seed, count,
                           project_id):
-        # pre-flight auth upkeep: rotate PSIDTS if stale, refresh at if old
+        # pre-flight auth upkeep: refresh `at` if old, and rotate PSIDTS ONLY
+        # when no browser exists to rotate it itself (see
+        # _server_should_rotate — two rotators sign the session out).
         try:
             if AUTH.jar:
-                AUTH.rotate()
+                if self._server_should_rotate():
+                    AUTH.rotate()
                 AUTH.ensure_at(max_age=1800)
         except Exception:
             pass
