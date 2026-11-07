@@ -1057,6 +1057,42 @@ if _fa_ok:
           " cannot kill a healthy session)",
           "AUTH.rotate(force=True)" in _fa_src3)
 
+    # The cheap restore logged "did not take" and fell through to a rebuild it
+    # did not need: it verified with the PREVIOUS session's cached `at` and gave
+    # up after one probe on a page that had only just started hydrating.
+    _soft_src = _fa_src3[_fa_src3.index("def _soft():"):
+                         _fa_src3.index("if eng is not None:")]
+    check("the in-place restore drops the stale `at` (else verification lies)",
+          "AUTH.invalidate_at()" in _soft_src)
+    check("...and retries the account read instead of trusting one probe",
+          "for _ in range(3):" in _soft_src and "eng.session_ok()" in _soft_src)
+
+# ── 27. session maxxing: survive a lapse, never start doomed ───────────────
+# Two goals: the session should not lapse in the first place, and if it does,
+# the user's request must still complete rather than being reported as a Google
+# auth problem.
+print("\n[27] session maxxing")
+if _fa_ok:
+    _fa4 = (pathlib.Path(ROOT) / "flow_api_headless.py").read_text(encoding="utf-8")
+    check("a job that hits a lapse requests a heal and RE-RUNS",
+          "session lapsed mid-job" in _fa4
+          and "job_retry_after_heal" in _fa4)
+    check("...and the retry is bounded to one",
+          "for attempt in (0, 1):" in _fa4 and "if ok or attempt == 1:" in _fa4)
+    _runner_src = _fa4[_fa4.index("def _runner():"):
+                       _fa4.index("threading.Thread(target=_runner")]
+    check("the job thread never heals INLINE (heal_session takes the engine "
+          "lock and rebuilds — that would kill the page the job holds)",
+          "self.heal_session(" not in _runner_src)
+    check("...it only asks, and waits on the verified flag",
+          "_heal_requested" in _runner_src and "_wait_for_session" in _runner_src)
+    check("the wait budget exists and is env-tunable",
+          hasattr(_FA, "SESSION_WAIT_S") and "FLOW_SESSION_WAIT_S" in _fa4)
+    check("the keepalive runs well inside Google's ~10-minute PSIDTS window",
+          "last_sess > 240" in _fa4)
+    check("a non-session failure is NOT retried (no pointless second render)",
+          "if not self._looks_like_dead_session(err):" in _runner_src)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

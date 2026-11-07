@@ -85,6 +85,13 @@ def save_state(st):
     STATE_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
 
 
+# How long a queued job will wait for the supervisor to heal a lapsed session
+# before giving up and reporting the failure. Generous, because the alternative
+# is throwing away a render the user already asked for: the supervisor notices
+# the request within one of its cycles, and the in-place restore is a reload.
+SESSION_WAIT_S = int(os.environ.get("FLOW_SESSION_WAIT_S", "420"))
+
+
 # ── pure-Python auth layer (flow_auth): jar + at token + rotation ──
 class _AuthState:
     """Holds the cookie jar + batchexecute tokens; owns the rotation loop.
@@ -659,6 +666,20 @@ class FlowAPI:
             print(f"[auth] harvest skipped: {str(e)[:110]}", flush=True)
             return []
 
+    def _wait_for_session(self, timeout=None) -> bool:
+        """Wait for the SUPERVISOR to finish healing the session.
+
+        Polls the verified flag, which heal_session sets only AFTER it has read
+        the account successfully — the same evidence the rest of the service
+        trusts, rather than a hopeful timer.
+        """
+        deadline = time.time() + (timeout or SESSION_WAIT_S)
+        while time.time() < deadline:
+            if getattr(self, "session_ok", False):
+                return True
+            time.sleep(5)
+        return False
+
     def heal_session(self, reason=""):
         """The ONE recovery path for every logged-out / 401 state.
 
@@ -708,13 +729,26 @@ class FlowAPI:
                 recs = _auth.load_records()
                 if recs:
                     ctx.add_cookies(recs)
+                # The cached `at` (XSRF) belongs to the session we are replacing.
+                # Leaving it makes the verification read a stale token and
+                # report failure even after a good restore — which is why the
+                # cheap path logged "did not take" and fell through to a full
+                # browser rebuild it did not need.
+                AUTH.invalidate_at()
                 try:
                     pid = load_state().get("project_id", "")
                 except Exception:
                     pid = ""
                 eng.goto_app(f"/project/{pid}" if pid else "/")
-                time.sleep(3)
-                return bool(eng.session_ok())
+                # Angular needs real time to hydrate here (0.1 CPU), and the
+                # account read is an RPC — one attempt after a fixed 3s sleep
+                # was far too optimistic.
+                time.sleep(6)
+                for _ in range(3):
+                    if eng.session_ok():
+                        return True
+                    time.sleep(4)
+                return False
 
             if eng is not None:
                 restored = bool(self.run(_soft, timeout=150,
@@ -927,7 +961,15 @@ class FlowAPI:
                     continue
                 # login check every ~10 min; a failure here re-mints rather
                 # than re-seeding the same (possibly stale) cookies
-                if time.time() - last_sess > 600:
+                # KEEPALIVE CADENCE. This check is itself the keepalive: it is
+                # an authenticated read, so it touches the session and keeps
+                # Google's own rotation flowing (which the harvest then adopts).
+                # Google rotates __Secure-1PSIDTS on a ~10-minute schedule, so a
+                # 10-minute check let the session drift right up to its expiry
+                # before anyone looked — and the drift is what got rejected.
+                # Four minutes keeps it well inside the window, and makes a
+                # lapse visible early instead of at the next job.
+                if time.time() - last_sess > 240:
                     last_sess = time.time()
                     if not self.ensure_session():
                         self.heal_session("periodic login check failed")
@@ -1189,25 +1231,54 @@ class FlowAPI:
 
         def _runner():
             _fs.job_update(jid, status="running", event="started")
-            try:
-                res = self.run(fn, timeout=timeout)
+            res = None
+            for attempt in (0, 1):
+                try:
+                    res = self.run(fn, timeout=timeout)
+                except Exception as e:  # noqa: BLE001
+                    _fs.job_update(jid, status="failed", event="crashed",
+                                   error=str(e)[:300])
+                    _fs.jlog("job_failed", job=jid, error=str(e)[:200])
+                    return
                 ok = not (isinstance(res, dict) and res.get("ok") is False)
-                if isinstance(res, dict) and res.get("media"):
-                    try:
-                        _fs.media_upsert(res["media"])
-                    except Exception:
-                        pass
-                _fs.job_update(jid, status="done" if ok else "failed",
-                               event="finished",
-                               result=res if ok else None,
-                               error=None if ok else (
-                                   res.get("error") if isinstance(res, dict)
-                                   else "failed"))
-                _fs.jlog("job_done", job=jid, ok=ok)
-            except Exception as e:  # noqa: BLE001
-                _fs.job_update(jid, status="failed", event="crashed",
-                               error=str(e)[:300])
-                _fs.jlog("job_failed", job=jid, error=str(e)[:200])
+                if ok or attempt == 1:
+                    break
+                err = res.get("error") if isinstance(res, dict) else ""
+                if not self._looks_like_dead_session(err):
+                    break
+                # THE REQUEST COMES FIRST. The user asked for an image, not a
+                # status report about Google logging us out. A lapsed session is
+                # recoverable, so request the heal and WAIT for the supervisor to
+                # run it. This thread must not heal inline: heal_session takes
+                # the engine lock `self.run` has only just released and rebuilds
+                # the browser, which from inside a job kills the page it holds.
+                # Then run the whole job again on the healed session.
+                print(f"[job] {jid}: session lapsed mid-job ({str(err)[:60]}) — "
+                      f"requesting a heal, then retrying the job", flush=True)
+                self._heal_requested = str(err)[:90]
+                self.session_ok = False
+                if not self._wait_for_session():
+                    print(f"[job] {jid}: session did not return within "
+                          f"{SESSION_WAIT_S}s — reporting the failure",
+                          flush=True)
+                    break
+                _fs.jlog("job_retry_after_heal", job=jid)
+                print(f"[job] {jid}: session healthy again — retrying the job",
+                      flush=True)
+
+            ok = not (isinstance(res, dict) and res.get("ok") is False)
+            if isinstance(res, dict) and res.get("media"):
+                try:
+                    _fs.media_upsert(res["media"])
+                except Exception:
+                    pass
+            _fs.job_update(jid, status="done" if ok else "failed",
+                           event="finished",
+                           result=res if ok else None,
+                           error=None if ok else (
+                               res.get("error") if isinstance(res, dict)
+                               else "failed"))
+            _fs.jlog("job_done", job=jid, ok=ok)
 
         threading.Thread(target=_runner, daemon=True).start()
         return jid
