@@ -20,7 +20,7 @@ from pathlib import Path
 
 from flow_headless import (HeadlessEngine, detect_headless_shell, load_state,
                            rss_mb_of, total_tree_rss_mb, read_rss_mb,
-                           proc_breakdown,
+                           proc_breakdown, ip_flag_status, ip_flag_cooldown_s,
                            MEM_GUARD_MB, PROFILE, ROOT, SITE_KEY)
 import flow_store as _fs
 import flow_auth as _auth
@@ -1025,6 +1025,11 @@ class FlowAPI:
             "cookies_ready": (ROOT / "sessions" / "flow.cookies.full.json").exists()
                              or bool(os.environ.get("FLOW_COOKIES_JSON", "").strip()),
             "proxy": bool(os.environ.get("FLOW_PROXY_URL", "").strip()),
+            # IP reputation. A flagged egress IP is the ONE failure this service
+            # cannot recover from by itself (no retry changes the IP), so it has
+            # to be visible in /health instead of buried in a log line — that is
+            # how "the jobs just fail now" stayed unexplained.
+            "ip_flag": ip_flag_status(),
             "session_ok": self.session_ok,
             "last_recover_ago_s": (round(time.time() - self.last_recover, 1)
                                    if self.last_recover else -1),
@@ -1041,6 +1046,16 @@ class FlowAPI:
 
     def status(self):
         return self._base_info()
+
+    def ip_cooldown(self) -> float:
+        """Seconds before another submission is worth attempting (0 = clear).
+
+        The server uses this to answer 503 + Retry-After instead of accepting a
+        job that is certain to spin for minutes and then fail."""
+        try:
+            return float(ip_flag_cooldown_s())
+        except Exception:
+            return 0.0
 
     def session_info(self):
         def job():

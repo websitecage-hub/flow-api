@@ -1093,6 +1093,66 @@ if _fa_ok:
     check("a non-session failure is NOT retried (no pointless second render)",
           "if not self._looks_like_dead_session(err):" in _runner_src)
 
+# ── 28. a flagged IP is handled, not hammered ─────────────────────────────
+# PUBLIC_ERROR_UNUSUAL_ACTIVITY is an IP score. The old code restarted the
+# browser and retried — same IP, another flagged request, ~50s of boot each
+# time — which is exactly how one bad score became a service that "just fails":
+# a 230-second generation that produced nothing, then every prompt after it.
+print("\n[28] a flagged IP backs off instead of being hammered")
+check("the flag helpers exist",
+      all(hasattr(FH, n) for n in ("note_ip_flag", "ip_flag_cooldown_s",
+                                   "ip_flag_status", "clear_ip_flag")))
+FH.clear_ip_flag()
+check("a clear IP has no cooldown", FH.ip_flag_cooldown_s() == 0)
+
+_w1 = FH.note_ip_flag("unit-test")
+check("the first flag backs off the base window",
+      abs(_w1 - FH.IP_FLAG_BASE_S) < 1, str(_w1))
+check("...and the cooldown is actually active", FH.ip_flag_cooldown_s() > 0)
+_w2 = FH.note_ip_flag("unit-test")
+check("a second consecutive flag backs off twice as long",
+      abs(_w2 - _w1 * 2) < 1, f"{_w1} -> {_w2}")
+for _ in range(8):
+    _wN = FH.note_ip_flag("unit-test")
+check("...capped so it cannot grow without bound",
+      _wN <= FH.IP_FLAG_MAX_S + 0.01, str(_wN))
+_st = FH.ip_flag_status()
+check("status reports the count and the remaining cooldown",
+      _st.get("count", 0) >= 10 and _st.get("cooldown_s", 0) > 0, str(_st))
+FH.clear_ip_flag()
+check("clearing resets everything",
+      FH.ip_flag_cooldown_s() == 0 and FH.ip_flag_status()["count"] == 0)
+
+check("generate() refuses up front while cooling down",
+      "IP-REPUTATION GATE" in _gen_src and "ip_flag_cooldown_s()" in _gen_src)
+check("a successful render clears the flag",
+      "clear_ip_flag()" in _fh_src)
+# the flag branch must NOT restart the browser any more
+_flag_branch = _fh_src[_fh_src.index('if "UNUSUAL_ACTIVITY" in body:'):
+                       _fh_src.index('parsed = parse_batchexecute(body)')]
+check("the flag branch no longer restarts the engine",
+      "self.restart()" not in _flag_branch, "restart still present")
+check("...it names the real fix (a residential proxy) in the error",
+      "FLOW_PROXY_URL" in _flag_branch)
+
+_fa5 = (pathlib.Path(ROOT) / "flow_api_headless.py").read_text(encoding="utf-8")
+check("/health exposes the IP flag", "ip_flag_status()" in _fa5)
+check("the API exposes a cooldown for the server to gate on",
+      "def ip_cooldown" in _fa5)
+_srv2 = (pathlib.Path(ROOT) / "flow_server.py").read_text(encoding="utf-8")
+check("/generate answers 503 + Retry-After while cooling down",
+      "ip_flagged" in _srv2 and '"Retry-After"' in _srv2)
+
+_ui3 = (pathlib.Path(ROOT) / "ui" / "index.html").read_text(encoding="utf-8")
+check("the UI has a failure banner (a failure must not look like a "
+      "disappearance)", 'id="banner"' in _ui3 and "function banner(" in _ui3)
+check("...it explains an IP cooldown before the user wastes a prompt",
+      "flagged this server" in _ui3 and "ipNotice" in _ui3)
+check("...it reports a failed job loudly",
+      "That render failed after" in _ui3)
+check("...and it explains a job lost to a restart",
+      "no longer on the server" in _ui3)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

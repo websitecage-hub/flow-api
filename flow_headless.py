@@ -49,6 +49,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -104,6 +105,69 @@ TYPE_DELAY_MS = int(os.environ.get("FLOW_TYPE_DELAY_MS", "25"))
 # separable by response time alone. Used to choose the ~2s in-place resubmit
 # over the engine rebuild (measured at 183s end-to-end).
 FAST_EMPTY_S = float(os.environ.get("FLOW_FAST_EMPTY_S", "10"))
+
+# ── IP-reputation backoff ──────────────────────────────────────────────────
+# PUBLIC_ERROR_UNUSUAL_ACTIVITY is an IP/fingerprint SCORE, not a content error.
+# When it fires, restarting the browser and retrying is worse than useless: the
+# IP has not changed, so the retry burns a full browser boot (~50 s) and submits
+# ANOTHER flagged request. That is how a merely-bad score becomes a worse one —
+# measured live as a 230-second generation that produced nothing, followed by
+# every subsequent prompt failing the same way.
+#
+# So a flag now sets a COOLDOWN instead of a retry: generations are refused with
+# a clear reason and a retry_after, and the window doubles for each consecutive
+# flag (5 → 10 → 20 → 40 → 60 min cap), so we back off harder the more insistent
+# Google is. A single success clears it. The point is to stop spending
+# reputation we do not have.
+_ip_flag = {"at": 0.0, "count": 0, "last_reason": ""}
+_ip_flag_lock = threading.Lock()
+IP_FLAG_BASE_S = float(os.environ.get("FLOW_IP_FLAG_BACKOFF_S", "300"))
+IP_FLAG_MAX_S = float(os.environ.get("FLOW_IP_FLAG_MAX_S", "3600"))
+
+
+def _ip_flag_wait_s(count: int) -> float:
+    if count <= 0:
+        return 0.0
+    return min(IP_FLAG_MAX_S, IP_FLAG_BASE_S * (2 ** (count - 1)))
+
+
+def note_ip_flag(reason: str = "") -> float:
+    """Record a reCAPTCHA IP flag. Returns the cooldown it now implies."""
+    with _ip_flag_lock:
+        _ip_flag["at"] = time.time()
+        _ip_flag["count"] += 1
+        _ip_flag["last_reason"] = str(reason)[:160]
+        n = _ip_flag["count"]
+    wait = _ip_flag_wait_s(n)
+    _log(f"[!] reCAPTCHA IP flag #{n} — cooling down {wait / 60:.0f} min instead "
+         f"of submitting another flagged request from the same IP")
+    return wait
+
+
+def ip_flag_cooldown_s() -> float:
+    """Seconds still to wait before another attempt is worth making. 0 = clear."""
+    with _ip_flag_lock:
+        at, n = _ip_flag["at"], _ip_flag["count"]
+    if not at or n <= 0:
+        return 0.0
+    return max(0.0, at + _ip_flag_wait_s(n) - time.time())
+
+
+def ip_flag_status() -> dict:
+    with _ip_flag_lock:
+        at, n, why = _ip_flag["at"], _ip_flag["count"], _ip_flag["last_reason"]
+    return {"count": n, "last_ago_s": (round(time.time() - at, 1) if at else -1),
+            "cooldown_s": round(ip_flag_cooldown_s(), 1), "reason": why}
+
+
+def clear_ip_flag():
+    with _ip_flag_lock:
+        n = _ip_flag["count"]
+        _ip_flag["at"] = 0.0
+        _ip_flag["count"] = 0
+        _ip_flag["last_reason"] = ""
+    if n:
+        _log(f"[*] reCAPTCHA IP flag cleared (was {n} consecutive flag(s))")
 
 
 def _proxy_config():
@@ -1694,6 +1758,18 @@ class HeadlessEngine:
         # fails, just log and CONTINUE — the composer drive below surfaces
         # the real error. ensure_session's browser restart is only safe
         # between jobs (supervisor path), never inside one.
+        # IP-REPUTATION GATE. If Google has flagged this server's IP, submitting
+        # again cannot succeed — it only spends more of a score we do not have.
+        # Refuse up front, before a page load, a composer wait or a render slot,
+        # so the caller gets an immediate and accurate reason instead of a
+        # multi-minute spin that ends in exactly the same place.
+        _cd = ip_flag_cooldown_s()
+        if _cd > 0:
+            self.last_error = (
+                f"reCAPTCHA IP cooldown active ({_cd / 60:.0f} min left) — not "
+                f"submitting another flagged request from this IP")
+            _log(f"[*] generate: {self.last_error}")
+            return None
         if not self.session_ok():
             # The account read failed. Two very different causes:
             #   (a) the probe false-negatives on a slow nzlxg (it has before),
@@ -1948,19 +2024,17 @@ class HeadlessEngine:
             return None
         body = caught[-1]
         if "UNUSUAL_ACTIVITY" in body:
-            self.last_error = ("reCAPTCHA flagged PUBLIC_ERROR_UNUSUAL_ACTIVITY "
-                               "(client IP / fingerprint scored low)")
+            # DO NOT restart-and-retry. The IP is unchanged, so a retry submits
+            # another flagged request and burns a ~50s browser boot doing it.
+            # That loop is what turned a 230-second generation into nothing and
+            # then poisoned every later prompt. Back off instead, and say so.
+            wait = note_ip_flag(f"UNUSUAL_ACTIVITY: {str(body)[:100]}")
+            self.last_error = (
+                "reCAPTCHA flagged this server's IP "
+                "(PUBLIC_ERROR_UNUSUAL_ACTIVITY) — generation paused for "
+                f"{wait / 60:.0f} min so the score can recover. Set "
+                "FLOW_PROXY_URL to a residential proxy to fix this properly.")
             _log(f"[!] generate: {self.last_error}")
-            if _escalate:
-                _log("[*] generate: restarting engine and retrying once (fresh reCAPTCHA state)")
-                try:
-                    self.restart()
-                except Exception as e:
-                    _log(f"[!] restart failed: {str(e)[:120]}")
-                    return None
-                return self.generate(prompt, model=model, aspect=aspect,
-                                     count=count, project_id=project_id,
-                                     seed=seed, _escalate=False)
             return None
         parsed = parse_batchexecute(body)
         for rid, data in parsed:
@@ -1968,6 +2042,8 @@ class HeadlessEngine:
                 items = self._parse_ogi(data)
                 if items:
                     self.last_error = ""
+                    # a real render means this IP is scoring fine again
+                    clear_ip_flag()
                     return items
         # An ogiZ0b response arrived but carried no media. That is usually a
         # transient (Google-side throttle, or two generations racing), and a

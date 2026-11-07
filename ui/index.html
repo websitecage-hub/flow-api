@@ -133,6 +133,16 @@
     padding:9px 16px;font-size:13px;box-shadow:0 10px 30px #0007;
     opacity:0;pointer-events:none;transition:opacity .2s}
   .toast.on{opacity:1}
+  /* A failure must never look like a silent disappearance. The old page let a
+     failed job vanish into a one-line note; this is impossible to miss. */
+  .banner{display:none;align-items:flex-start;gap:10px;padding:11px 14px;
+    font-size:13px;border-bottom:1px solid var(--line);line-height:1.45}
+  .banner.on{display:flex}
+  .banner.bad{background:#2a1416;color:#ffd7d9}
+  .banner.warn{background:#2a2312;color:#ffeec2}
+  .banner b{font-weight:650}
+  .banner button{margin-left:auto;background:transparent;border-color:#ffffff33;
+    color:inherit;padding:3px 10px;font-size:12px;border-radius:99px}
 </style>
 </head>
 <body>
@@ -152,6 +162,11 @@
   <button data-tab="upload">Upload</button>
   <button data-tab="api">API</button>
 </nav>
+
+<div class="banner" id="banner">
+  <span id="bannerText"></span>
+  <button id="bannerClose">dismiss</button>
+</div>
 
 <main id="canvas">
   <section class="page on" id="p-create">
@@ -279,6 +294,20 @@ function toast(msg, ms = 2600) {
   toast._t = setTimeout(() => t.classList.remove('on'), ms);
 }
 
+/* A failure has to be impossible to miss. A job that dies used to leave a
+   one-line note under the composer — so a refresh, or simply not scrolling,
+   made it look like the render silently vanished. */
+function banner(msg, kind = 'bad') {
+  const b = $('#banner');
+  $('#bannerText').innerHTML = msg;
+  b.className = 'banner on ' + kind;
+}
+function hideBanner() { $('#banner').className = 'banner'; }
+/* the health poll re-arms this, so dismissing the IP notice must stick until
+   the cooldown actually clears */
+let ipNotice = false;
+$('#bannerClose').onclick = () => { hideBanner(); ipNotice = true; };
+
 /* ── status ─────────────────────────────────────────────────────────── */
 let HEALTH = {};
 async function pollHealth() {
@@ -303,6 +332,21 @@ async function pollHealth() {
     </div>`).join('');
   $('#healthNote').textContent = h.last_error
     ? 'last error: ' + h.last_error : 'no errors reported';
+  // Surface the IP cooldown BEFORE the user wastes a prompt on it. This is the
+  // one failure the service cannot recover from by itself, so it must be
+  // visible rather than discovered as a mystery failure.
+  const ipf = h.ip_flag || {};
+  const cooling = r.ok && Number(ipf.cooldown_s) > 0;
+  if (cooling && !ipNotice) {
+    ipNotice = true;
+    banner('<b>Generation is paused — Google flagged this server\'s IP.</b> ' +
+           Math.ceil(Number(ipf.cooldown_s) / 60) + ' min left. It clears on ' +
+           'its own; a residential proxy (<code>FLOW_PROXY_URL</code>) is the ' +
+           'permanent fix.', 'warn');
+  } else if (!cooling) {
+    ipNotice = false;                       // re-arm once it has cleared
+    if ($('#banner').className.indexOf('warn') > -1) hideBanner();
+  }
 }
 /* /health is polled even from a background tab: it is what keeps a free-tier
    service awake, and it costs one cheap request. The expensive polls below do
@@ -411,6 +455,14 @@ async function submit(body) {
   for (let i = 0; i < 8; i++) {
     const r = await api('/generate', {method: 'POST', body: JSON.stringify(body)});
     if (r.status === 202 && r.body.job) return {ok: true, job: r.body.job};
+    if (r.status === 503 && r.body && r.body.ip_flagged) {
+      // The server refuses during an IP cooldown rather than accepting a job it
+      // knows will fail. Pass the reason through instead of retrying: more
+      // requests only spend more of a score that is already too low.
+      return {ok: false, ip: true,
+              retry_s: parseInt(r.body.retry_after_s || '300', 10) || 300,
+              msg: r.body.error || "reCAPTCHA flagged this server's IP"};
+    }
     if (r.status === 401) {
       return {ok: false, msg: 'not authorised — put your API key in the box at ' +
                               'the top right and press Save'};
@@ -485,8 +537,12 @@ async function watch(job, t0) {
   } else {
     $('#prog').className = 'bad';
     $('#prog').style.width = '100%';
-    $('#genNote').textContent = 'failed after ' + took + 's: ' +
-      JSON.stringify(jb.error || jb).slice(0, 200);
+    // Never let a failed render be mistaken for one that silently vanished:
+    // say it, loudly, with the reason the engine gave.
+    const why = String(jb.error || 'the engine returned nothing');
+    $('#genNote').textContent = 'failed after ' + took + 's';
+    banner('<b>That render failed after ' + took + 's.</b> ' +
+           esc(why.slice(0, 300)));
   }
   setTimeout(() => {$('#prog').className = ''; $('#prog').style.width = '0';}, 5000);
 }
@@ -506,9 +562,15 @@ async function go() {
   if (!s.ok) {
     $('#genNote').textContent = 'submit failed: ' + s.msg;
     $('#prog').style.width = '0';
+    if (s.ip) {
+      banner('<b>Generation is paused.</b> ' + esc(s.msg), 'warn');
+    } else {
+      banner('<b>Could not start the render.</b> ' + esc(s.msg));
+    }
     btn.disabled = false; BUSY = false;
     return;
   }
+  hideBanner();
   $('#genNote').textContent = `job ${s.job} submitted — starting the render...`;
   await watch(s.job, Date.now());
   btn.disabled = false; BUSY = false;
@@ -545,8 +607,11 @@ $('#prompt').addEventListener('keydown', e => {
   }
   if (jb.status === 'failed' || jb.status === 'error') {
     localStorage.removeItem('flowjob');
-    $('#genNote').textContent = `job ${saved.job} ${jb.status}: ` +
-      JSON.stringify(jb.error || '').slice(0, 160);
+    // This is the case that read as "it just disappeared": the job failed while
+    // the tab was closed/refreshed, and the old page cleared it in silence.
+    const why = String(jb.error || 'the engine returned nothing');
+    $('#genNote').textContent = `job ${saved.job} ${jb.status}`;
+    banner('<b>Your last render failed.</b> ' + esc(why.slice(0, 300)));
     return;
   }
   if (jb.status === 'running') {
@@ -556,7 +621,16 @@ $('#prompt').addEventListener('keydown', e => {
     BUSY = false; $('#go').disabled = false;
     return;
   }
-  localStorage.removeItem('flowjob');            // unknown job id
+  // The job row is gone entirely — the service restarted (no persistent disk
+  // wipes the job table), so that render cannot be recovered. Say so instead of
+  // dropping it in silence, which is exactly what made a lost render look like a
+  // UI bug.
+  localStorage.removeItem('flowjob');
+  $('#genNote').textContent = 'the last job is no longer on the server';
+  banner('<b>That render was lost.</b> Job <code>' + esc(saved.job) +
+         '</code> is no longer on the server — it was still running when the ' +
+         'service restarted, and in-flight jobs do not survive a restart (the ' +
+         'free tier has no persistent disk).', 'warn');
 })();
 
 /* ── upload ─────────────────────────────────────────────────────────── */

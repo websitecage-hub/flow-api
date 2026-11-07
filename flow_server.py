@@ -398,6 +398,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(p.query)
         wait = (qs.get("wait", ["0"])[0] == "1")
         if p.path == "/generate":
+            # IP-REPUTATION GATE, checked FIRST. If Google has flagged this
+            # server's IP, a submission cannot succeed — retrying only spends
+            # more of a score we do not have, and the old behaviour (restart the
+            # browser, retry, restart again) turned it into a 230-second job
+            # that produced nothing and left the user staring at "busy". Answer
+            # with a clear 503 + Retry-After instead, so the client can say WHY
+            # and when to come back.
+            try:
+                cd = api.ip_cooldown()
+                if cd and cd > 0:
+                    mins = max(1, int(cd / 60 + 0.999))
+                    self._send(503, {
+                        "ok": False, "ip_flagged": True,
+                        "error": ("reCAPTCHA flagged this server's IP "
+                                  "(PUBLIC_ERROR_UNUSUAL_ACTIVITY) — generation "
+                                  f"paused for about {mins} more min so it can "
+                                  "recover. A residential proxy "
+                                  "(FLOW_PROXY_URL) is the real fix."),
+                        "retry_after_s": int(cd) + 1,
+                    }, headers={"Retry-After": str(int(cd) + 1)})
+                    return
+            except Exception:
+                pass
             # ONE-GENERATION-AT-A-TIME GUARD: overlapping generates stack
             # page loads inside the single chrome (each ~110MB of Angular
             # hydration) and snowball the container past 512MB. Return 429
