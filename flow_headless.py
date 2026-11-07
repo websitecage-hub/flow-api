@@ -98,6 +98,13 @@ AT_WAIT_S = int(os.environ.get("FLOW_AT_WAIT_S", "60"))
 # prompt of ~55 characters near 1.5 s instead of 12 s.
 TYPE_DELAY_MS = int(os.environ.get("FLOW_TYPE_DELAY_MS", "25"))
 
+# An EMPTY generation answer that arrives faster than this is an error frame,
+# not a failed render. Measured: every successful render answered in 21-24s and
+# every "ogiZ0b response had no media" arrived in under 7s, so the two are
+# separable by response time alone. Used to choose the ~2s in-place resubmit
+# over the engine rebuild (measured at 183s end-to-end).
+FAST_EMPTY_S = float(os.environ.get("FLOW_FAST_EMPTY_S", "10"))
+
 
 def _proxy_config():
     """Optional egress proxy for the browser, from FLOW_PROXY_URL.
@@ -1970,6 +1977,20 @@ class HeadlessEngine:
         _log(f"[!] generate: {self.last_error}; body[:300]="
              f"{str(body)[:300]!r} rpcids={[p[0] for p in parsed][:6]}")
         if _escalate:
+            # HOW FAST it came back decides the recovery. Measured across runs:
+            # every successful render answered in 21-24s, and every "no media"
+            # answer arrived in under 7s. So a sub-10s empty answer is not a
+            # failed render — it is an error frame, and the cheap fix is to
+            # submit again on the SAME warm page (~2s) rather than rebuilding the
+            # engine, which measured 183s end-to-end for one job.
+            render_s = _T.get("response", 0) - _T.get("typed", 0)
+            if render_s and render_s < FAST_EMPTY_S:
+                _log(f"[*] generate: empty answer after only {render_s:.1f}s — an "
+                     f"error frame, not a render; resubmitting on the warm page")
+                time.sleep(1.5)
+                return self.generate(prompt, model=model, aspect=aspect,
+                                     count=count, project_id=project_id,
+                                     seed=seed, _escalate=False)
             _log("[*] generate: retrying once on a fresh page (no-media heal)")
             try:
                 self.restart()

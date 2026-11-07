@@ -867,7 +867,9 @@ check("the prompt is VERIFIED in the composer before submitting",
       "composer holds" in _gen_src
       and _gen_src.index("composer holds") < _gen_src.index('press("Enter")'))
 check("...replacing the fixed 1.5s hope with a real check",
-      "time.sleep(1.5)" not in _gen_src)
+      # the old code slept blindly right after typing; the check must sit there
+      # instead (other sleeps elsewhere in the flow are deliberate)
+      "delay=TYPE_DELAY_MS)\n            time.sleep(1.5)" not in _gen_src)
 check("the post-composer settle is no longer 2s of dead waiting",
       "_pump(seconds=2)" not in _gen_src)
 check("...and is tunable without a deploy",
@@ -945,6 +947,25 @@ _r = _eng7._wait_at(timeout=60)
 _dt = time.time() - _t0
 check("the token wait gives up on a logged-out page immediately",
       _r == "" and _dt < 5, f"returned {_r!r} after {_dt:.1f}s (budget was 60s)")
+
+# ── 24. an empty answer is tellable from a render by HOW FAST it returns ───
+# Measured: successful renders answered in 21-24s; every "no media" answer came
+# back in under 7s. So the failure is identifiable at once, and can be retried
+# in place (~2s) instead of triggering an engine rebuild (183s end-to-end).
+print("\n[24] fast empty answers get the cheap retry, not the rebuild")
+check("a fast-empty threshold exists", hasattr(FH, "FAST_EMPTY_S"))
+check("...and it is env-tunable",
+      "FLOW_FAST_EMPTY_S" in
+      (pathlib.Path(ROOT) / "flow_headless.py").read_text(encoding="utf-8"))
+check("...set below the fastest successful render ever measured (21s)",
+      0 < FH.FAST_EMPTY_S < 20, str(FH.FAST_EMPTY_S))
+check("the response time is what selects the recovery",
+      "render_s" in _gen_src and "not a render" in _gen_src)
+check("the cheap path resubmits WITHOUT rebuilding the engine",
+      _gen_src.index("resubmitting on the warm page")
+      < _gen_src.index("no-media heal"))
+check("...and the rebuild is still there for genuinely slow empties",
+      "no-media heal" in _gen_src and "self.restart()" in _gen_src)
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
