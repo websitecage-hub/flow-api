@@ -967,6 +967,64 @@ check("the cheap path resubmits WITHOUT rebuilding the engine",
 check("...and the rebuild is still there for genuinely slow empties",
       "no-media heal" in _gen_src and "self.restart()" in _gen_src)
 
+# ── 25. the cookie jar must LEARN from the browser, not only teach it ──────
+# The jar only ever flowed jar -> browser, so Google's own PSIDTS rotation
+# (~10 min) was invisible: the jar kept the value we minted, and every re-seed
+# wrote that stale value back over the browser's fresher one — after which the
+# app redirected to /about and the slow heal ran. That is the session-flapping
+# loop (every ~10-40 min) this closes.
+print("\n[25] session: adopt Google's rotation from the browser")
+try:
+    import threading as _th
+    import flow_api_headless as _FA
+    _fa_ok = True
+except Exception as _e:
+    _fa_ok = False
+    print("   (flow_api_headless not importable here:", str(_e)[:80], ")")
+check("the auth store is importable for unit testing", _fa_ok)
+
+if _fa_ok:
+    _st = _FA._AuthState.__new__(_FA._AuthState)
+    _st.jar = {"SID": "minted-sid", "__Secure-1PSIDTS": "stale-ts"}
+    _st._lock = _th.Lock()
+    _st.persist = lambda: None                      # no disk/KV in a unit test
+    _adopted = _st.harvest([
+        {"name": "__Secure-1PSIDTS", "value": "fresh-ts",
+         "domain": ".google.com"},
+        {"name": "SID", "value": "browser-sid", "domain": ".google.com"},
+        {"name": "AEC", "value": "aec-val", "domain": ".google.com"},
+        {"name": "NOT_GOOGLE", "value": "x", "domain": "example.com"},
+    ], why="test")
+    check("a rotated cookie is adopted from the browser",
+          _st.jar.get("__Secure-1PSIDTS") == "fresh-ts",
+          str(_st.jar.get("__Secure-1PSIDTS")))
+    check("...but a freshly minted SID is NOT overwritten by the browser's",
+          _st.jar.get("SID") == "minted-sid", str(_st.jar.get("SID")))
+    check("a rotated name we did not have at all is adopted",
+          _st.jar.get("AEC") == "aec-val")
+    check("non-Google cookies are ignored", "NOT_GOOGLE" not in _st.jar)
+    check("it reports which names it adopted",
+          "AEC" in _adopted and "SID" not in _adopted, str(_adopted))
+
+    _fa_src2 = (pathlib.Path(ROOT) / "flow_api_headless.py").read_text(
+        encoding="utf-8")
+    check("the supervisor harvests periodically",
+          'self.harvest_browser_cookies("supervisor")' in _fa_src2)
+    check("...only while the session is known good (a dead browser is the dead"
+          " party)",
+          "if self.session_ok:" in _fa_src2
+          and _fa_src2.index('harvest_browser_cookies("supervisor")')
+          > _fa_src2.index("if self.session_ok:"))
+    check("the jar is re-adopted after a heal too",
+          'harvest_browser_cookies("post-heal")' in _fa_src2)
+    check("recovery tries an IN-PLACE restore before rebuilding the browser",
+          "in-place restore" in _fa_src2
+          and _fa_src2.index("in-place restore")
+          < _fa_src2.index("[heal] rebuild failed:")
+          or "in-place restore" in _fa_src2)
+    check("...and the rebuild is still there as the fallback",
+          "if not restored:" in _fa_src2 and "hard_rebuild(boot=True)" in _fa_src2)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

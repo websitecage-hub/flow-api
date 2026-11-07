@@ -210,6 +210,51 @@ class _AuthState:
             self.jar = jar
         self.persist()
 
+    # Google rotates these on its own schedule, so whatever the BROWSER holds is
+    # by definition fresher than anything we minted or rotated earlier.
+    ROTATED_NAMES = ("__Secure-1PSIDTS", "__Secure-3PSIDTS",
+                     "__Secure-1PSIDCC", "__Secure-3PSIDCC", "SIDCC", "AEC")
+
+    def harvest(self, cookies, why=""):
+        """Adopt rotated cookies FROM THE BROWSER into the jar.
+
+        The jar only ever flowed jar -> browser (load/persist/rotate all write
+        outward). Google rotates PSIDTS on its own ~10-minute schedule, so the
+        jar kept the value we last minted, and every re-seed wrote that stale
+        value back over the browser's fresher one — after which the app
+        redirected to /about and the whole slow heal ran. That is the loop this
+        closes: the browser becomes the single source of truth for rotated
+        names, and the jar/KV simply follow it.
+
+        Only rotation-sensitive names are adopted unconditionally. Other cookies
+        are taken solely when we have none at all, so a harvest can never
+        overwrite an authoritative freshly-minted SID.
+        """
+        adopted = []
+        try:
+            for c in cookies or []:
+                n = str(c.get("name") or "")
+                v = str(c.get("value") or "")
+                dom = str(c.get("domain") or "").lower()
+                if not n or not v or "google" not in dom:
+                    continue
+                cur = self.jar.get(n)
+                if cur == v:
+                    continue
+                if n in self.ROTATED_NAMES or cur is None:
+                    with self._lock:
+                        self.jar[n] = v
+                    adopted.append(n)
+        except Exception as e:
+            print(f"[auth] harvest error: {str(e)[:110]}", flush=True)
+            return []
+        if adopted:
+            self.persist()
+            print(f"[auth] harvested {len(adopted)} cookie(s) from the browser"
+                  f"{(' — ' + why) if why else ''}: {sorted(adopted)[:6]}",
+                  flush=True)
+        return adopted
+
     # -- rotation --------------------------------------------------------
     def rotate(self, force=False):
         if not self.jar:
@@ -579,6 +624,19 @@ class FlowAPI:
             "401", "403", "logged out", "no project id", "create_project",
             "session", "no at token", "cookie", "unauthenticated"))
 
+    def harvest_browser_cookies(self, why=""):
+        """Read the browser's LIVE cookies and let the jar adopt the rotated
+        ones. Upkeep, not a critical path — never raises."""
+        try:
+            eng = self.engine
+            ctx = getattr(eng, "ctx", None) if eng is not None else None
+            if ctx is None:
+                return []
+            return AUTH.harvest(ctx.cookies(), why=why)
+        except Exception as e:
+            print(f"[auth] harvest skipped: {str(e)[:110]}", flush=True)
+            return []
+
     def heal_session(self, reason=""):
         """The ONE recovery path for every logged-out / 401 state.
 
@@ -612,10 +670,43 @@ class FlowAPI:
                 print(f"[heal] re-mint failed: {str(e)[:160]}", flush=True)
         else:
             print("[heal] no master token/email set — cannot re-mint", flush=True)
+        # CHEAP PATH FIRST. A rebuild costs ~1-3 minutes (boot, hydrate, re-seed)
+        # and throws away the live page. But when the browser is alive and only
+        # the COOKIES lapsed — the common case — the login can be restored where
+        # it stands: push the freshly minted cookies into the live context and
+        # reload. Rebuild only if that does not take.
+        restored = False
         try:
-            self.hard_rebuild(boot=True)
+            eng = self.engine
+
+            def _soft():
+                ctx = getattr(eng, "ctx", None) if eng is not None else None
+                if ctx is None:
+                    return False
+                recs = _auth.load_records()
+                if recs:
+                    ctx.add_cookies(recs)
+                try:
+                    pid = load_state().get("project_id", "")
+                except Exception:
+                    pid = ""
+                eng.goto_app(f"/project/{pid}" if pid else "/")
+                time.sleep(3)
+                return bool(eng.session_ok())
+
+            if eng is not None:
+                restored = bool(self.run(_soft, timeout=150,
+                                         _rebuild_on_timeout=False))
+                print(f"[heal] in-place restore "
+                      f"{'worked' if restored else 'did not take'} "
+                      f"(no browser rebuild)", flush=True)
         except Exception as e:
-            print(f"[heal] rebuild failed: {str(e)[:130]}", flush=True)
+            print(f"[heal] in-place restore failed: {str(e)[:120]}", flush=True)
+        if not restored:
+            try:
+                self.hard_rebuild(boot=True)
+            except Exception as e:
+                print(f"[heal] rebuild failed: {str(e)[:130]}", flush=True)
         ok = False
         try:
             ok = bool(self.run(lambda: self.engine.credits() is not None,
@@ -626,6 +717,9 @@ class FlowAPI:
         if ok:
             self.last_recover = time.time()
             self.last_error = ""
+            # the browser has just negotiated its own cookies — adopt them, so
+            # the jar does not immediately fall behind the rotation again
+            self.harvest_browser_cookies("post-heal")
             print("[heal] session recovered", flush=True)
         else:
             print("[heal] session STILL failing after re-mint", flush=True)
@@ -660,6 +754,14 @@ class FlowAPI:
                 # ── pure-Python auth upkeep (no browser needed) ──
                 if AUTH.jar:
                     AUTH.rotate()                    # ≥600s cadence internally
+                    # THE MISSING DIRECTION. The jar only ever flowed
+                    # jar -> browser, so Google's own PSIDTS rotation (~10 min)
+                    # was invisible to us and the next re-seed wrote the stale
+                    # value back over the fresh one — killing the session. Only
+                    # harvest while the session is known good: when it is dead,
+                    # the browser is the dead party and its values are worthless.
+                    if self.session_ok:
+                        self.harvest_browser_cookies("supervisor")
                     if (time.time() - boot_ts) > 120:
                         AUTH.ensure_at(max_age=1800)  # 30 min; skip boot race
                 # ── MEM-SPEC watchdog: total tree RSS guard ──
