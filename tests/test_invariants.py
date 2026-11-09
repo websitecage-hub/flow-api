@@ -1227,6 +1227,39 @@ check("boot logs whether egress is proxied",
       "egress proxy:" in (pathlib.Path(ROOT) / "flow_headless.py").read_text(
           encoding="utf-8"))
 
+# ── 30. WARP standby ships in the image, dormant unless FLOW_WARP=1 ────────
+# Render's egress IP gets reCAPTCHA-flagged (measured, recovered). The standby
+# is a userspace WARP tunnel (wgcf + wireproxy): verified end-to-end on the dev
+# box — generation done, 0 flags, +56s vs direct. It must cost NOTHING while
+# off (no processes, no RAM) and must fall back to direct egress if the tunnel
+# does not pass traffic.
+print("\n[30] WARP standby (dormant, verified fallback)")
+_dockerfile = (pathlib.Path(ROOT) / "Dockerfile").read_text(encoding="utf-8")
+check("the image ships wgcf + wireproxy (pinned versions)",
+      "WGCF_VERSION" in _dockerfile and "WIREPROXY_VERSION" in _dockerfile
+      and "wireproxy" in _dockerfile and "wgcf" in _dockerfile)
+check("the Dockerfile documents why (flagged IP, no TUN on Render free)",
+      "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in _dockerfile
+      and "NET_ADMIN" in _dockerfile)
+
+_start = (pathlib.Path(ROOT) / "start.sh").read_text(encoding="utf-8")
+check("the standby is OFF by default", '${FLOW_WARP:-0}' in _start)
+check("...and activates only on FLOW_WARP=1",
+      '"${FLOW_WARP:-0}" = "1"' in _start)
+check("the identity persists in the profile dir (registered once)",
+      "wgcf-profile.conf" in _start and "$WARP_DIR" in _start)
+check("wireproxy gets the v1.0.9 host:port BindAddress format "
+      "(the host+Port split panics: 'missing port in address')",
+      "BindAddress = 127.0.0.1:1080" in _start
+      and "missing port in address" in _start)
+check("the tunnel is VERIFIED before it is trusted — egress IP check gates "
+      "FLOW_PROXY_URL",
+      "api.ipify.org" in _start and "tunnel UP" in _start)
+check("a dead tunnel falls back to direct egress (never a swallowed proxy)",
+      "falling back to direct egress" in _start and "kill \"$WPID\"" in _start)
+check("SIGTERM cleanup kills wireproxy too (no stale tunnel across deploys)",
+      'pkill -9 -f "wireproxy"' in _start)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

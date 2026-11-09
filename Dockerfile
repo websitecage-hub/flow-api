@@ -39,6 +39,25 @@ RUN pip install --no-cache-dir -r requirements.docker.txt \
 # (observed directly). `--with-deps` usually pulls them; pinning them here
 # makes the image deterministic.
 
+# 2) WARP STANDBY (dormant unless FLOW_WARP=1 at boot).
+#    Render's shared egress IP can get flagged by reCAPTCHA
+#    (PUBLIC_ERROR_UNUSUAL_ACTIVITY — measured live, recovered after rest).
+#    The standby is a WARP tunnel: wgcf registers the free anonymous identity
+#    and wireproxy turns it into a local SOCKS5 proxy — userspace WireGuard,
+#    because Render free has no TUN device / NET_ADMIN for a real interface.
+#    ~17 MB of static Go binaries, zero processes and zero RAM until
+#    FLOW_WARP=1. Versions verified working together on the dev box.
+ARG WGCF_VERSION=2.2.22
+ARG WIREPROXY_VERSION=1.0.9
+RUN curl -fsSL -o /usr/local/bin/wgcf \
+      "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64" \
+    && curl -fsSL -o /tmp/wireproxy.tar.gz \
+      "https://github.com/pufferffish/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_amd64.tar.gz" \
+    && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
+    && chmod +x /usr/local/bin/wgcf /usr/local/bin/wireproxy \
+    && rm -f /tmp/wireproxy.tar.gz \
+    && /usr/local/bin/wireproxy --version 2>&1 | head -1
+
 # App code (engine + server + store + CLI). flow_api.py (full-Chrome) stays
 # for compat but is never the engine under FLOW_ENGINE=headless.
 COPY flow_api.py flow_headless.py flow_api_headless.py flow_auth.py \
