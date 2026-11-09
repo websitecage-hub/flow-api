@@ -752,7 +752,7 @@ def _free_port() -> int:
 
 
 class Context:
-    def __init__(self, browser: "Browser"):
+    def __init__(self, browser: "Browser", proxy_auth: Optional[tuple] = None):
         self._b = browser
         self._conn = browser._conn
         self._sid = browser._sid
@@ -761,7 +761,24 @@ class Context:
         self._fetch_on = False
         self._paused_ids: Dict[str, float] = {}
         self._closed = False
+        # (username, password) for an authenticated egress proxy, or None.
+        self._proxy_auth = proxy_auth if (proxy_auth and all(proxy_auth)) else None
+        self._auth_on = False
         self.page = Page(self._conn, self._sid)
+
+    def arm_proxy_auth(self) -> bool:
+        """Start answering proxy auth challenges (407) with our credentials.
+
+        Chrome has NO `--proxy-auth` switch — the driver used to pass one, and
+        Chrome ignored it, so an authenticated proxy failed with 407 and looked
+        like a broken proxy rather than a missing feature. The DevTools Fetch
+        domain can answer the challenge properly, which is the only reliable way
+        to use a paid/residential proxy. Safe to call with no proxy configured.
+        """
+        if not self._proxy_auth:
+            return False
+        self._enable_fetch()
+        return True
 
     # -- pages -------------------------------------------------
     @property
@@ -788,14 +805,49 @@ class Context:
             self._enable_fetch()
 
     def _enable_fetch(self):
+        params: Dict[str, Any] = {"patterns": [{"urlPattern": "*",
+                                                "requestStage": "Request"}]}
+        if self._proxy_auth:
+            # ALSO answer proxy 407 challenges, not just intercept requests.
+            params["handleAuthRequests"] = True
         try:
-            self.page._send("Fetch.enable",
-                            {"patterns": [{"urlPattern": "*",
-                                           "requestStage": "Request"}]},
-                            timeout=20)
+            self.page._send("Fetch.enable", params, timeout=20)
         except Exception:
             return
         self._fetch_on = True
+        if self._proxy_auth and not self._auth_on:
+            self._auth_on = True
+
+            def _auth(p, sid):
+                """Answer a proxy auth challenge with the configured credentials.
+
+                Without this a paid/residential proxy is unusable: Chrome cannot
+                be handed credentials on the command line, so the challenge goes
+                unanswered and every request 407s.
+                """
+                rid = p.get("requestId") or ""
+                ch = p.get("authChallenge") or {}
+                try:
+                    self.page._send("Fetch.continueWithAuth", {
+                        "requestId": rid,
+                        "authChallengeResponse": {
+                            "response": "ProvideCredentials",
+                            "username": self._proxy_auth[0],
+                            "password": self._proxy_auth[1]}}, timeout=15)
+                    print("[cdp] proxy auth supplied "
+                          f"({str(ch.get('origin') or ch.get('realm'))[:60]})",
+                          flush=True)
+                except Exception as e:
+                    print(f"[cdp] proxy auth failed: {str(e)[:90]}", flush=True)
+                    try:
+                        self.page._send("Fetch.continueWithAuth", {
+                            "requestId": rid,
+                            "authChallengeResponse": {"response": "CancelAuth"}},
+                            timeout=10)
+                    except Exception:
+                        pass
+
+            self._conn.on("Fetch.authRequired", _auth)
 
         def _paused(p, sid):
             rid = p.get("requestId", "")
@@ -1083,13 +1135,20 @@ class _Chromium:
             srv = (proxy.get("server") or "").strip()
             if srv:
                 extra.append(f"--proxy-server={srv}")
-            if proxy.get("username"):
-                extra.append(f"--proxy-auth={proxy['username']}:"
-                             f"{proxy.get('password', '')}")
+            # NOTE: deliberately NO --proxy-auth here. Chrome has no such switch
+            # — it was silently ignored, so an authenticated proxy answered 407
+            # to everything and looked like a broken proxy rather than a missing
+            # feature. The credentials are answered over CDP instead, via
+            # Context.arm_proxy_auth(), armed just below.
         b = Browser(executable_path or "", user_data_dir, extra)
         b.start()
         self._pw._browser = b
-        return Context(b)
+        ctx = Context(b, proxy_auth=((proxy or {}).get("username"),
+                                     (proxy or {}).get("password")))
+        if ctx.arm_proxy_auth():
+            print("[cdp] proxy auth armed — 407 challenges will be answered",
+                  flush=True)
+        return ctx
 
 
 class Playwright:

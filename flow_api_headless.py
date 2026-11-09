@@ -21,6 +21,7 @@ from pathlib import Path
 from flow_headless import (HeadlessEngine, detect_headless_shell, load_state,
                            rss_mb_of, total_tree_rss_mb, read_rss_mb,
                            proc_breakdown, ip_flag_status, ip_flag_cooldown_s,
+                           _proxy_config,
                            MEM_GUARD_MB, PROFILE, ROOT, SITE_KEY)
 import flow_store as _fs
 import flow_auth as _auth
@@ -1025,6 +1026,10 @@ class FlowAPI:
             "cookies_ready": (ROOT / "sessions" / "flow.cookies.full.json").exists()
                              or bool(os.environ.get("FLOW_COOKIES_JSON", "").strip()),
             "proxy": bool(os.environ.get("FLOW_PROXY_URL", "").strip()),
+            # Is an authenticated proxy configured AND answerable? Without the
+            # CDP auth handler an authenticated proxy 407s on every request, so
+            # this distinguishes "proxy set" from "proxy usable".
+            "proxy_auth": bool((_proxy_config() or {}).get("username")),
             # IP reputation. A flagged egress IP is the ONE failure this service
             # cannot recover from by itself (no retry changes the IP), so it has
             # to be visible in /health instead of buried in a log line — that is

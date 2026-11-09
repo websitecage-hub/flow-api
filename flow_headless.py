@@ -864,14 +864,19 @@ class HeadlessEngine:
         # env flag only for builds that honour it.
         if os.environ.get("FLOW_SINGLE_PROCESS", "1") != "0":
             args.append("--single-process")
+        _pc = _proxy_config()
         self.ctx = self.pw.chromium.launch_persistent_context(
             str(PROFILE), executable_path=self.exe, headless=True,
             bypass_csp=True,               # needed for in-page script inject
             user_agent=SPOOF_UA,           # reCAPTCHA: no "HeadlessChrome" brand
             ignore_default_args=["--enable-automation"],
             viewport={"width": 1280, "height": 900},
-            proxy=_proxy_config(),         # optional residential egress
+            proxy=_pc,                     # optional residential egress
             args=args)
+        # Make the egress path visible at boot: a flagged datacentre IP and a
+        # working residential one look identical in every other log line.
+        _log(f"[*] egress proxy: {'set' if _pc else 'none (datacentre IP)'}"
+             f"{' — authenticated (CDP-answered)' if (_pc or {}).get('username') else ''}")
         try:
             self.ctx.add_init_script(STEALTH_JS)
         except Exception:

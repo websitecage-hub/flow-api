@@ -1153,6 +1153,80 @@ check("...it reports a failed job loudly",
 check("...and it explains a job lost to a restart",
       "no longer on the server" in _ui3)
 
+# ── 29. an authenticated proxy must actually work ─────────────────────────
+# The driver passed `--proxy-auth=user:pass`, which is NOT a Chrome switch. It
+# was silently ignored, so an authenticated proxy answered 407 to every request
+# and looked like a broken proxy rather than a missing feature — which would
+# have wasted the one thing that fixes a flagged IP.
+print("\n[29] authenticated proxies: credentials answered over CDP")
+
+
+class _FakeConn2:
+    def __init__(self):
+        self.handlers = {}
+
+    def on(self, name, fn):
+        self.handlers[name] = fn
+
+    def off(self, name, fn):
+        self.handlers.pop(name, None)
+
+
+class _FakePage2:
+    def __init__(self):
+        self.sent = []
+
+    def _send(self, method, params=None, **k):
+        self.sent.append((method, params or {}))
+        return {}
+
+
+def _ctx_with(creds):
+    c = _CDP.Context.__new__(_CDP.Context)
+    c._proxy_auth = creds
+    c._auth_on = False
+    c._fetch_on = False
+    c._paused_ids = {}
+    c._closed = True                 # makes the sweeper exit immediately
+    c._routes = []
+    c._page = None
+    c.page = _FakePage2()
+    c._conn = _FakeConn2()
+    c._sid = "s"
+    return c
+
+
+check("the driver can arm proxy auth", hasattr(_CDP.Context, "arm_proxy_auth"))
+_c3 = _ctx_with(("user", "pass"))
+check("arming with credentials succeeds", _c3.arm_proxy_auth() is True)
+_en = [p for m, p in _c3.page.sent if m == "Fetch.enable"]
+check("Fetch.enable turns on handleAuthRequests",
+      _en and _en[-1].get("handleAuthRequests") is True, str(_en[-1:]))
+check("an authRequired handler is registered",
+      "Fetch.authRequired" in _c3._conn.handlers)
+_c3._conn.handlers["Fetch.authRequired"](
+    {"requestId": "r1", "authChallenge": {"origin": "proxy.local"}}, None)
+_cw = [p for m, p in _c3.page.sent if m == "Fetch.continueWithAuth"]
+check("the challenge is answered with our credentials",
+      _cw and _cw[-1]["authChallengeResponse"]["response"] == "ProvideCredentials"
+      and _cw[-1]["authChallengeResponse"]["username"] == "user"
+      and _cw[-1]["authChallengeResponse"]["password"] == "pass", str(_cw[-1:]))
+
+_c4 = _ctx_with(None)
+check("no credentials -> nothing armed (and no Fetch overhead)",
+      _c4.arm_proxy_auth() is False and not _c4.page.sent)
+
+_cdp_src = (pathlib.Path(ROOT) / "flow_cdp.py").read_text(encoding="utf-8")
+check("the dead --proxy-auth flag is gone", "--proxy-auth=" not in _cdp_src)
+check("...and the reason it was dead is recorded", "no such switch" in _cdp_src)
+check("the launch path arms auth automatically",
+      "arm_proxy_auth()" in _cdp_src and "proxy auth armed" in _cdp_src)
+check("/health distinguishes proxy-set from proxy-usable",
+      '"proxy_auth"' in _fa5)
+check("boot logs whether egress is proxied",
+      "egress proxy:" in (pathlib.Path(ROOT) / "flow_headless.py").read_text(
+          encoding="utf-8"))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)
