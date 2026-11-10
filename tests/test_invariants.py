@@ -676,7 +676,7 @@ check("'/about' short-circuits before the reload",
       _fh.find('if "/about" in first_url:') <
       _fh.find("generate: reloading the app once"))
 check("the fast path explains itself in the log",
-      "session looks logged out) —" in _fh)
+      "cookie settings rejected (CookieMismatch)" in _fh)
 
 # ── 19. aspect ratio is a PROJECT SETTING, not a request field ─────────────
 # Every image came back 16:9 however the API was called. Cause: aspect is a
@@ -1259,6 +1259,33 @@ check("a dead tunnel falls back to direct egress (never a swallowed proxy)",
       "falling back to direct egress" in _start and "kill \"$WPID\"" in _start)
 check("SIGTERM cleanup kills wireproxy too (no stale tunnel across deploys)",
       'pkill -9 -f "wireproxy"' in _start)
+
+# ── 31. CookieMismatch: Google rejected the jar itself ────────────────────
+# Measured live as a 959-second failure: the page bounced to
+# accounts.google.com/CookieMismatch ("problem with your cookie settings"),
+# the fast-fail only knew /about so it reloaded and waited the full composer
+# timeout, and the heal then ADDED fresh cookies on top of the poisoned ones —
+# same-name duplicates with different attributes let the rejected cookie keep
+# winning. The manual fix for this exact error (the user's reference video,
+# timestamped) is "clear the browser cookies, then log in again".
+print("\n[31] CookieMismatch: fast-fail + clear-before-restore")
+_fh31 = (pathlib.Path(ROOT) / "flow_headless.py").read_text(encoding="utf-8")
+check("the fast-fail recognizes Google auth surfaces, not just /about",
+      '"accounts.google.com" in first_url' in _fh31)
+check("...names CookieMismatch as its own case",
+      "CookieMismatch" in _fh31 and "cookie settings rejected" in _fh31)
+_cdp31 = (pathlib.Path(ROOT) / "flow_cdp.py").read_text(encoding="utf-8")
+check("the driver can wipe the jar (Network.clearBrowserCookies)",
+      "def clear_cookies" in _cdp31 and "clearBrowserCookies" in _cdp31)
+_fa31 = (pathlib.Path(ROOT) / "flow_api_headless.py").read_text(encoding="utf-8")
+check("the heal clears cookies BEFORE restoring — but only on an auth surface",
+      "cleared" in _fa31 and "accounts.google.com" in url if False else
+      ('"accounts.google.com" in url' in _fa31
+       and "before restoring" in _fa31
+       and _fa31.index("clear_cookies") < _fa31.index("ctx.add_cookies(recs)")))
+check("a healthy session is never wiped (the clear is gated on the URL)",
+      _fa31.index('"accounts.google.com" in url') < _fa31.index("clear_cookies()")
+      < _fa31.index("ctx.add_cookies(recs)"))
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

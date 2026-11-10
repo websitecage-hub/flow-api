@@ -967,6 +967,24 @@ class Context:
                 except Exception:
                     pass
 
+    def clear_cookies(self) -> int:
+        """Wipe ALL cookies in the browser context (CDP Network.clearBrowserCookies).
+
+        Exists for ONE reason: Google's CookieMismatch bounce. When Google has
+        rejected the jar itself (accounts.google.com/CookieMismatch — "problem
+        with your cookie settings"), re-adding cookies on top of the poisoned
+        ones can leave same-name duplicates with different attributes, so the
+        rejected cookie keeps winning and the mismatch repeats. The manual fix
+        a human does for this exact error is "clear the browser cookies, then
+        log in again" — this is that, automated. Returns the count of cookies
+        deleted as reported by Chrome.
+        """
+        try:
+            r = self.page._send("Network.clearBrowserCookies", {}, timeout=30)
+            return int((r or {}).get("count") or 0)
+        except Exception:
+            return 0
+
     def cookies(self) -> List[dict]:
         try:
             r = self.page._send("Network.getAllCookies", {}, timeout=30) or {}

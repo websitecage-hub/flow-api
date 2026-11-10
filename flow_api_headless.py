@@ -729,6 +729,28 @@ class FlowAPI:
                     return False
                 recs = _auth.load_records()
                 if recs:
+                    # CookieMismatch rule: when Google has REJECTED the jar
+                    # (accounts.google.com/CookieMismatch — "problem with your
+                    # cookie settings"), adding fresh cookies on top of the
+                    # poisoned ones can leave same-name duplicates with
+                    # different attributes, and the rejected cookie keeps
+                    # winning — the mismatch repeats forever. A human fixing
+                    # this exact error clears the browser cookies first and
+                    # logs in again; do the same. Only on an auth surface — a
+                    # healthy session must never have its jar wiped.
+                    try:
+                        url = str(getattr(eng.page, "url", "") or "")
+                    except Exception:
+                        url = ""
+                    if "accounts.google.com" in url:
+                        try:
+                            n = ctx.clear_cookies()
+                            print(f"[heal] auth surface detected "
+                                  f"({url[:70]}) — cleared {n} cookies "
+                                  f"before restoring", flush=True)
+                        except Exception as e:
+                            print(f"[heal] cookie clear failed: "
+                                  f"{str(e)[:100]}", flush=True)
                     ctx.add_cookies(recs)
                 # The cached `at` (XSRF) belongs to the session we are replacing.
                 # Leaving it makes the verification read a stale token and

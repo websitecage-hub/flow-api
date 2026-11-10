@@ -421,7 +421,10 @@ _SHELL_NAMES = ["chrome-headless-shell", "headless_shell"]
 def detect_headless_shell() -> str:
     """Return a chrome-headless-shell path, or '' if none found."""
     env = os.environ.get("FLOW_CHROME", "").strip()
-    if env and Path(env).exists() and "headless-shell" in env:
+    if env and Path(env).exists():
+        # FLOW_CHROME is an explicit operator override — trust it even if the
+        # binary is not literally named "headless-shell" (e.g. a full chromium
+        # on a dev box with no matching shared-library set for the shell build).
         return env
     for n in _SHELL_NAMES:
         w = shutil.which(n)
@@ -1898,15 +1901,26 @@ class HeadlessEngine:
                 probe = self.page_probe()
                 _log(f"[!] generate: composer not found — page={json.dumps(probe)}")
                 first_url = str(probe.get("url") or "")
-                if "/about" in first_url:
+                # Google auth surfaces mean the COOKIES THEMSELVES were
+                # rejected — most notably accounts.google.com/CookieMismatch,
+                # where Google shows "We've detected a problem with your
+                # cookie settings". A reload CANNOT fix that (the same jar is
+                # rejected again), and waiting one out was measured as ~960s
+                # of pure loss before this fast-fail existed. Fail now so the
+                # caller heals immediately.
+                if ("/about" in first_url
+                        or "accounts.google.com" in first_url):
                     # Flow's logged-out landing page. A reload CANNOT restore a
                     # missing session, and waiting one out was pure loss —
                     # measured live: /about seen at 10:46:58, reload burned
                     # until 10:49:15, heal finished 10:50:28. Six and a half
                     # minutes for one image, 2m17s of it knowing the answer.
                     # Fail now so the caller heals immediately.
+                    label = ("cookie settings rejected (CookieMismatch)"
+                             if "CookieMismatch" in first_url
+                             else "session looks logged out")
                     self.last_error = (
-                        f"composer not found (session looks logged out) — "
+                        f"composer not found ({label}) — "
                         f"page={first_url[:90]} has_at={probe.get('has_at')}")
                     _log(f"[!] generate: {self.last_error}")
                     return None
