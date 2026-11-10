@@ -795,6 +795,7 @@ class HeadlessEngine:
         self._be_base = ""            # app's own batchexecute URL (captured, reused)
         self._live_at = ""            # app's own at token (captured from its body)
         self._force_reseed = False    # set by restart(reseed=True)
+        self._cookie_mismatch_seen = False  # page bounced to CookieMismatch
         self.last_error = ""          # last engine-side failure (surfaced by /health)
         self.mint_error = ""          # optional reCAPTCHA fallback failure
 
@@ -867,6 +868,40 @@ class HeadlessEngine:
         # env flag only for builds that honour it.
         if os.environ.get("FLOW_SINGLE_PROCESS", "1") != "0":
             args.append("--single-process")
+        # CookieMismatch escape hatch. Google sometimes rejects the profile's
+        # whole cookie STORE (page lands on accounts.google.com/CookieMismatch
+        # — "problem with your cookie settings"). No amount of re-injecting
+        # cookies fixes that, because the poisoned cookies live in the
+        # profile's on-disk store and survive every restart — measured live as
+        # a 30-minute rebuild loop. When FLOW_NUKE_PROFILE_COOKIES=1, this
+        # boot deletes the persisted cookie/session files first, so the
+        # browser starts from a clean store and only the freshly injected jar
+        # exists. One-shot per boot (the env flag is only set by heal paths).
+        if os.environ.get("FLOW_NUKE_PROFILE_COOKIES", "") == "1":
+            import shutil as _sh
+            _wiped = []
+            for _name in ("Default/Cookies", "Default/Cookies-journal",
+                          "Default/Network/Cookies",
+                          "Default/Network/Cookies-journal",
+                          "Default/Sessions", "Default/Session Storage",
+                          "Default/Extension State"):
+                _p = PROFILE / _name
+                try:
+                    if _p.is_dir():
+                        _sh.rmtree(_p, ignore_errors=True)
+                        _wiped.append(_name + "/")
+                    elif _p.exists():
+                        _p.unlink(missing_ok=True)
+                        _wiped.append(_name)
+                except Exception:
+                    pass
+            try:
+                os.environ.pop("FLOW_NUKE_PROFILE_COOKIES")
+            except Exception:
+                pass
+            _log("[*] profile cookie store wiped for a clean re-login ("
+                 + ", ".join(_wiped[:6]) + ")") if _wiped else _log(
+                     "[*] FLOW_NUKE_PROFILE_COOKIES set but nothing to wipe")
         _pc = _proxy_config()
         self.ctx = self.pw.chromium.launch_persistent_context(
             str(PROFILE), executable_path=self.exe, headless=True,
@@ -1190,6 +1225,19 @@ class HeadlessEngine:
         self.last_error = "logged out"
         if reseed:
             _log("[*] session lost -> re-seeding cookies and rebuilding")
+            # If the LAST known page was a Google auth surface — most
+            # importantly accounts.google.com/CookieMismatch — the profile's
+            # on-disk cookie STORE is what Google is rejecting. Re-injecting
+            # the same jar over it loops forever (measured: 30+ minutes of
+            # rebuild -> CookieMismatch -> rebuild). Wipe the persisted store
+            # first so this boot starts clean; the seed below re-adds the jar.
+            try:
+                _last = str(getattr(self.page, "url", "") or "")
+            except Exception:
+                _last = ""
+            if "accounts.google.com" in _last or self._cookie_mismatch_seen:
+                os.environ["FLOW_NUKE_PROFILE_COOKIES"] = "1"
+                self._cookie_mismatch_seen = False
             try:
                 self.restart(reseed=True)
             except Exception as e:
@@ -1493,8 +1541,14 @@ class HeadlessEngine:
                 at = self._wait_at(AT_WAIT_S if attempt == 0 else 20)
             if not at:
                 self.last_error = "no at token"
+                _u = str(self.page_probe().get("url") or "")
+                # Remember the bounce: ensure_session uses this to decide the
+                # profile's persisted cookie store must be wiped before the
+                # next boot (re-injecting over it loops on CookieMismatch).
+                if "accounts.google.com" in _u:
+                    self._cookie_mismatch_seen = True
                 _log(f"[!] rpc {rpcid}: no `at` token after waiting — the page "
-                     f"never initialised (url={self.page_probe().get('url')!s:.80})")
+                     f"never initialised (url={_u[:80]})")
                 return None
             r = self.page.evaluate(JS_RPC, {
                 "rpcid": rpcid, "payload": payload, "at": at, "pid": pid,

@@ -1287,6 +1287,27 @@ check("a healthy session is never wiped (the clear is gated on the URL)",
       _fa31.index('"accounts.google.com" in url') < _fa31.index("clear_cookies()")
       < _fa31.index("ctx.add_cookies(recs)"))
 
+# ── 32. CookieMismatch loop: the poisoned store must be wiped, not re-topped
+# Measured live as a 30+ minute busy-loop: rebuild -> CookieMismatch -> rebuild.
+# The poisoned cookies live in the profile's ON-DISK store and survive every
+# restart; re-injecting the same jar over them changes nothing.
+print("\n[32] CookieMismatch loop breaker (wipe the persisted store)")
+check("engine start can wipe the profile's cookie/session files",
+      "FLOW_NUKE_PROFILE_COOKIES" in _fh31)
+check("...including the Network/Cookies layout modern chrome uses",
+      "Default/Network/Cookies" in _fh31)
+check("the wipe is one-shot per boot (flag consumed)",
+      'os.environ.pop("FLOW_NUKE_PROFILE_COOKIES")' in _fh31)
+check("the engine remembers an auth-surface bounce",
+      "_cookie_mismatch_seen = True" in _fh31)
+check("ensure_session wipes before restart when bounced",
+      _fh31.find("FLOW_NUKE_PROFILE_COOKIES") > 0
+      and "self._cookie_mismatch_seen" in _fh31)
+check("the API heal wipes before its rebuild too",
+      "auth-surface bounce detected" in _fa31)
+check("the wipe is bounded to named store files (never the whole profile)",
+      "Default/Cookies" in _fh31 and "rmtree(PROFILE" not in _fh31)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

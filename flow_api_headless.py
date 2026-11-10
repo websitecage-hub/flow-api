@@ -782,6 +782,25 @@ class FlowAPI:
         except Exception as e:
             print(f"[heal] in-place restore failed: {str(e)[:120]}", flush=True)
         if not restored:
+            # If the live page was bounced to a Google auth surface, the
+            # profile's persisted cookie store is what Google rejects — a
+            # rebuild that keeps it loops (measured: 30+ min of
+            # rebuild -> CookieMismatch -> rebuild). Wipe it for this boot;
+            # hard_rebuild -> engine start deletes the store files first.
+            try:
+                _u = str(getattr(getattr(self.engine, "page", None),
+                                 "url", "") or "")
+            except Exception:
+                _u = ""
+            _mm = bool(getattr(self.engine, "_cookie_mismatch_seen", False))
+            if "accounts.google.com" in _u or _mm:
+                os.environ["FLOW_NUKE_PROFILE_COOKIES"] = "1"
+                try:
+                    self.engine._cookie_mismatch_seen = False
+                except Exception:
+                    pass
+                print("[heal] auth-surface bounce detected — the rebuild will "
+                      "start from a wiped cookie store", flush=True)
             try:
                 self.hard_rebuild(boot=True)
             except Exception as e:
