@@ -47,16 +47,25 @@ RUN pip install --no-cache-dir -r requirements.docker.txt \
 #    because Render free has no TUN device / NET_ADMIN for a real interface.
 #    ~17 MB of static Go binaries, zero processes and zero RAM until
 #    FLOW_WARP=1. Versions verified working together on the dev box.
+# NOTE: python:3.11-slim has NO curl (this exact gap failed 4 deploys in a
+# row on Render — /bin/sh: curl: not found). The apt line above runs before
+# this one and leaves lists behind until the cleanup below, so install curl
+# HERE in the same RUN that needs it, then clean up.
 ARG WGCF_VERSION=2.2.22
 ARG WIREPROXY_VERSION=1.0.9
-RUN curl -fsSL -o /usr/local/bin/wgcf \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSL -o /usr/local/bin/wgcf \
       "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64" \
     && curl -fsSL -o /tmp/wireproxy.tar.gz \
       "https://github.com/pufferffish/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_amd64.tar.gz" \
     && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
     && chmod +x /usr/local/bin/wgcf /usr/local/bin/wireproxy \
     && rm -f /tmp/wireproxy.tar.gz \
-    && /usr/local/bin/wireproxy --version 2>&1 | head -1
+    && /usr/local/bin/wireproxy --version \
+    && rm -rf /var/lib/apt/lists/*
+# NOTE: curl is deliberately NOT purged — start.sh needs it at runtime
+# (PROFILE_TAR_URL seeding, the WARP tunnel egress check).
 
 # App code (engine + server + store + CLI). flow_api.py (full-Chrome) stays
 # for compat but is never the engine under FLOW_ENGINE=headless.

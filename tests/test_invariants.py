@@ -1260,6 +1260,25 @@ check("a dead tunnel falls back to direct egress (never a swallowed proxy)",
 check("SIGTERM cleanup kills wireproxy too (no stale tunnel across deploys)",
       'pkill -9 -f "wireproxy"' in _start)
 
+# ── 33. the Dockerfile must BUILD on python:3.11-slim ─────────────────────
+# Four deploys in a row failed with /bin/sh: curl: not found — slim has no
+# curl, and the WARP binaries step called it bare. Green builds are not
+# optional: an undeployed fix is a fix that does not exist.
+print("\n[33] Dockerfile builds on slim (no curl exists there)")
+_dk33 = (pathlib.Path(ROOT) / "Dockerfile").read_text(encoding="utf-8")
+_aptline = _dk33[_dk33.index("ARG WGCF_VERSION"):
+                 _dk33.index("App code")]
+check("the WARP step installs its own curl (slim has none)",
+      "apt-get install -y --no-install-recommends ca-certificates curl"
+      in _aptline)
+check("...and cleans the apt lists in the same layer",
+      "rm -rf /var/lib/apt/lists/*" in _aptline
+      and "apt-get purge" not in _aptline)
+check("no bare curl outside an install step in the Dockerfile",
+      _dk33.count("curl -fsSL") == 2 and "apt-get install" in _aptline)
+check("runtime KEEPS curl (start.sh needs it: profile seed + WARP check)",
+      "apt-get purge -y curl" not in _dk33)
+
 # ── 31. CookieMismatch: Google rejected the jar itself ────────────────────
 # Measured live as a 959-second failure: the page bounced to
 # accounts.google.com/CookieMismatch ("problem with your cookie settings"),
