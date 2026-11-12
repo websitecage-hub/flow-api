@@ -10,11 +10,6 @@ playwright>=1.40
 curl_cffi>=0.5
 gpsoauth>=1.4
 websocket-client>=1.7   # pure-Python CDP transport (replaces the Node driver)
-requests>=2.31          # BypassV3 mint (vendored bypass_vendor.py)
-# NOTE: requests is ALSO a transitive dep of gpsoauth (requests>=2.0.0), so
-# it was already in the image before this line was added. The explicit pin is
-# kept (the vendored BypassV3 imports it directly) but do not be surprised if
-# removing it changes nothing — and do not expect it to change the build.
 # Watermark removal (dewatermark_server.py). Pillow only — the alpha mask is
 # embedded, so numpy is NOT needed in the image.
 Pillow>=10.0
