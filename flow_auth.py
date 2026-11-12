@@ -29,6 +29,7 @@ No browser, no CDP, no DBSC proof. curl_cffi for TLS-JA3 realism.
 from __future__ import annotations
 
 import os
+import random
 import re
 import time
 import json
@@ -384,8 +385,16 @@ def extract_wiz(session: "cffi.Session") -> tuple[str, str]:
 
 
 def _freq(chunks) -> str:
-    """URLSearchParams-style encoding of f.req (matches the browser)."""
-    return _quote(json.dumps(chunks), safe="")
+    """URLSearchParams-style encoding of f.req (matches the browser).
+
+    COMPACT separators are REQUIRED, not cosmetic: json.dumps' default puts
+    a space after every comma, and Google's batchexecute parser rejects the
+    spaced form with er 400 "e,4" (malformed f.req) — measured live:
+    `["nzlxg", "[]"]` -> 400, `["nzlxg","[]"]` -> 200. The browser's
+    JSON.stringify never emits spaces, which is why only in-page RPCs worked
+    before this was found.
+    """
+    return _quote(json.dumps(chunks, separators=(",", ":")), safe="")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -396,8 +405,15 @@ def rpc(session: "cffi.Session", rpcid: str, payload, at: str,
     """One batchexecute call with cookies + at. Returns (status, parsed)."""
     url = (FLOW_ORIGIN + BE_PATH +
            f"?rpcids={rpcid}&source-path={_quote(source_path, safe='')}"
-           f"&bl={bl}&f.sid={fsid}&rt=c")
-    body = ("f.req=" + _freq([[rpcid, json.dumps(payload), None, "generic"]])
+           f"&bl={bl}&f.sid={fsid}&hl=en&_reqid={random.randint(1000, 999999)}"
+           f"&rt=c")
+    # f.req is TRIPLE-nested: [ [ [rpcid, json-payload, null, "generic"] ] ] —
+    # batch wrapper, chunk list, chunk. The old two-level form here was
+    # rejected with er 400 "e,4" on every call, while the identical payload
+    # triple-nested (as the browser and the in-page JS_RPC send it) returns
+    # 200 — measured live repeatedly. Compact separators required as well.
+    body = ("f.req=" + _freq([[[rpcid, json.dumps(payload, separators=(",", ":")),
+                                None, "generic"]]])
             + "&at=" + _quote(at, safe=""))
     r = session.post(
         url, data=body,

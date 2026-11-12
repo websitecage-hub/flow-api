@@ -1210,7 +1210,9 @@ class FlowAPI:
             except Exception as e:
                 out["steps"]["fingerprint"] = {"ok": False, "error": str(e)[:150]}
             try:
-                tok = eng.mint("GENERATE")
+                tok = eng.mint("GENERATE")   # /diag mint probe: action is just
+                # a liveness check for the execute() call itself, not used to
+                # fire anything — the action string does not matter here.
                 out["steps"]["mint"] = {"ok": bool(tok), "token_len": len(tok or "")}
             except Exception as e:
                 out["steps"]["mint"] = {"ok": False, "error": str(e)[:150]}
@@ -1509,7 +1511,8 @@ class FlowAPI:
             "count": "1 (Flow returns 2 images per call)",
             "upscale": ["2K", "4K"],
             "recaptcha_actions": {"image": "IMAGE_GENERATION",
-                                  "text": "GENERATE"},
+                                  "text": "GENERATE",
+                                  "upsample": "UPSAMPLE"},
             "endpoints": {
                 "GET": ["/health", "/models", "/session", "/whoami", "/diag",
                         "/credits", "/projects", "/project", "/project/new",

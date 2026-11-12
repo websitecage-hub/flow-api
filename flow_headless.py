@@ -198,6 +198,8 @@ def _proxy_config():
 #   request[5] = imageModelKey  (NOT imageModelName)
 #   request[4] = aspectRatio int (16:9→3, 4:3→5, 1:1→1, 3:4→4, 9:16→2)
 #   recaptcha action for images = "IMAGE_GENERATION" (not "GENERATE")
+ACTION_IMAGE = os.environ.get("FLOW_ACTION_IMAGE", "IMAGE_GENERATION")
+ACTION_TEXT = "GENERATE"
 MODEL_DISPLAY = {
     "NANO BANANA 2.1": "BELUGA",
     "NANO BANANA 2.1 THINKING LOW": "BELUGA_THINKING_LOW",
@@ -1350,8 +1352,19 @@ class HeadlessEngine:
             return False
 
     # ── primitives ───────────────────────────────────────────────
-    def mint(self, action: str = "GENERATE") -> str:
-        """Fresh reCAPTCHA Enterprise token for `action` (single-use)."""
+    def mint(self, action: str = "IMAGE_GENERATION") -> str:
+        """Fresh reCAPTCHA Enterprise token for `action` (single-use).
+
+        Action provenance (VERIFY-FIRST rule, 2026-11-12): image generation's
+        action is "IMAGE_GENERATION" — read from the app's own bundle in the
+        2026-10-07 live capture (commit 3005ae8: "recaptcha action for images
+        is IMAGE_GENERATION (not GENERATE); site key from
+        WIZ_global_data.xZbWve"). The old default "GENERATE" is the TEXT
+        action; using it for an image generate would mint a VALID token that
+        silently scores ~0 — exactly the false-gate-verdict failure mode. The
+        capture file itself (recon/auth/) was never committed, so the commit
+        message is the record; both mint adapters must use this constant.
+        """
         r = self.page.evaluate(JS_MINT.replace("'GENERATE'", json.dumps(action)),
                                SITE_KEY, timeout=120)
         if not (r or {}).get("ok"):
