@@ -27,8 +27,24 @@ WORKDIR /app
 # off). Pin the light one explicitly. Browsers land in the default
 # /root/.cache/ms-playwright, which the engine's auto-detect already globs.
 COPY requirements.docker.txt ./
-RUN pip install --no-cache-dir -r requirements.docker.txt \
-    && playwright install --with-deps chromium-headless-shell \
+# PIP AND BROWSER ARE SEPARATE LAYERS ON PURPOSE.
+# The browser download is the flaky part: playwright's CDN intermittently
+# fails ("Download failure, code=1") on Render's build machines, and when it
+# was chained with && after pip, a flaky download killed the WHOLE build in
+# ~20 seconds. It went unnoticed because the layer was CACHED — the first
+# requirements.docker.txt edit since the last green build invalidated the
+# cache and exposed it. Splitting the layers means a browser-download blip
+# fails only THAT layer (and Render retries it) instead of the entire image,
+# and pip keeps its own cache independently.
+RUN pip install --no-cache-dir -r requirements.docker.txt
+# The browser binary: retry inside the layer (CDN blips are transient), and
+# keep the layer split so a failure here is isolated.
+RUN for i in 1 2 3; do \
+      playwright install --with-deps chromium-headless-shell && break; \
+      echo "[build] playwright download attempt $i failed — retrying in 20s"; \
+      sleep 20; \
+    done \
+    && playwright install chromium-headless-shell \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
        fontconfig fonts-liberation fonts-dejavu-core \
