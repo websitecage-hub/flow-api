@@ -39,12 +39,20 @@ COPY requirements.docker.txt ./
 RUN pip install --no-cache-dir -r requirements.docker.txt
 # The browser binary: retry inside the layer (CDN blips are transient), and
 # keep the layer split so a failure here is isolated.
+#
+# CRITICAL: invoke playwright as `python -m playwright`, NOT as the bare
+# `playwright` console script. Splitting this into its own RUN exposed a
+# failure that the old single-RUN form hid: the console script is not
+# resolvable in the new layer's shell, so the build died with
+#   "process ... did not complete successfully: exit code: 127"
+# (127 = command not found) — reproducible locally. `python -m playwright`
+# uses the module entry point and cannot hit that, whatever PATH looks like.
 RUN for i in 1 2 3; do \
-      playwright install --with-deps chromium-headless-shell && break; \
+      python -m playwright install --with-deps chromium-headless-shell && break; \
       echo "[build] playwright download attempt $i failed — retrying in 20s"; \
       sleep 20; \
     done \
-    && playwright install chromium-headless-shell \
+    && python -m playwright install chromium-headless-shell \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
        fontconfig fonts-liberation fonts-dejavu-core \
